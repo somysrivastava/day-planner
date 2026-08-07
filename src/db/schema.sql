@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS users (
   phone_number TEXT NOT NULL UNIQUE,
   timezone TEXT NOT NULL DEFAULT 'UTC',
   briefing_time TIME NOT NULL DEFAULT '07:30:00',
+  google_refresh_token TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
