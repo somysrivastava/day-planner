@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from typing import Optional
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -55,6 +56,7 @@ def create_event(
     start_datetime: str,
     end_datetime: str,
     time_zone: str,
+    recurrence: Optional[list[str]] = None,
 ):
     creds = _get_credentials_for_user(db, user_id)
     service = build("calendar", "v3", credentials=creds)
@@ -65,5 +67,7 @@ def create_event(
         "start": {"dateTime": start_datetime, "timeZone": time_zone},
         "end": {"dateTime": end_datetime, "timeZone": time_zone},
     }
+    if recurrence:
+        event_body["recurrence"] = recurrence  # e.g. ["RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"]
 
     return service.events().insert(calendarId="primary", body=event_body).execute()

@@ -1,6 +1,6 @@
-from datetime import datetime, time
+from datetime import date, datetime, time
 
-from sqlalchemy import CheckConstraint, ForeignKey, String, Text, TIMESTAMP, Time
+from sqlalchemy import Boolean, CheckConstraint, Date, ForeignKey, String, Text, TIMESTAMP, Time, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -15,6 +15,8 @@ class User(Base):
     timezone: Mapped[str] = mapped_column(String, nullable=False, server_default="UTC")
     briefing_time: Mapped[time] = mapped_column(Time, nullable=False, server_default="07:30:00")
     google_refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    wake_time: Mapped[time] = mapped_column(Time, nullable=False, server_default="06:00:00")
+    sleep_time: Mapped[time] = mapped_column(Time, nullable=False, server_default="23:00:00")
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
 
 
@@ -36,3 +38,23 @@ class Item(Base):
     google_event_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+
+
+# A date-specific exception to a fixed_event's recurring schedule: fully
+# skipped that date, shifted to one replacement range, or split into two
+# ranges (an explicit-time item colliding with the block). At most two
+# segments — nothing in the spec implies more than one collision-driven
+# split of the same block on the same date.
+class FixedEventOverride(Base):
+    __tablename__ = "fixed_event_overrides"
+    __table_args__ = (UniqueConstraint("item_id", "override_date"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), nullable=False)
+    override_date: Mapped[date] = mapped_column(Date, nullable=False)
+    skip: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    segment_1_start: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    segment_1_end: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    segment_2_start: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    segment_2_end: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())

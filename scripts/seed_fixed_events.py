@@ -21,12 +21,14 @@ def ts(date: str, time: str) -> str:
     return f"{date}T{time}:00{TZ_OFFSET}"
 
 
-def upsert_user(db, phone: str, tz: str) -> User:
+def upsert_user(db, phone: str, tz: str, wake_time: str = "06:00:00", sleep_time: str = "23:00:00") -> User:
     user = db.query(User).filter(User.phone_number == phone).first()
     if user:
         user.timezone = tz
+        user.wake_time = wake_time
+        user.sleep_time = sleep_time
     else:
-        user = User(phone_number=phone, timezone=tz)
+        user = User(phone_number=phone, timezone=tz, wake_time=wake_time, sleep_time=sleep_time)
         db.add(user)
     db.commit()
     db.refresh(user)
@@ -60,7 +62,7 @@ def main():
     db = SessionLocal()
 
     # --- Real user: your actual routine ---
-    you = upsert_user(db, "+919354211791", "Asia/Kolkata")
+    you = upsert_user(db, "+919354211791", "Asia/Kolkata", wake_time="04:30:00")
     reset_fixed_events(db, you.id)
     add_fixed_event(db, you.id, "Gym", ts(MONDAY, "05:00"), ts(MONDAY, "07:30"), WEEKDAYS_RULE)
     add_fixed_event(db, you.id, "Office", ts(MONDAY, "10:00"), ts(MONDAY, "19:00"), WEEKDAYS_RULE)
