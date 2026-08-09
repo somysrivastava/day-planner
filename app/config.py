@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     database_url: str
     google_client_id: str
     google_client_secret: str
+    openai_api_key: str
+    token_encryption_key: str
 
 
 settings = Settings()
