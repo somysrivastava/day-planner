@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.db.base import get_db
 from app.db.models import User
 from app.services.google_auth import get_auth_url, get_refresh_token_from_code
+from app.services.token_crypto import encrypt_token
 
 router = APIRouter()
 
@@ -39,7 +40,7 @@ def google_auth_callback(
     if not user:
         raise HTTPException(status_code=404, detail=f"User {user_id} not found")
 
-    user.google_refresh_token = refresh_token
+    user.google_refresh_token = encrypt_token(refresh_token)
     db.commit()
 
     return PlainTextResponse("Google Calendar connected. You can close this tab.")

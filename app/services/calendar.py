@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db.models import User
+from app.services.token_crypto import decrypt_token
 
 
 # Builds a Credentials object holding only a refresh token. The
@@ -19,7 +20,7 @@ def _get_credentials_for_user(db: Session, user_id: int) -> Credentials:
 
     return Credentials(
         token=None,
-        refresh_token=user.google_refresh_token,
+        refresh_token=decrypt_token(user.google_refresh_token),
         token_uri="https://oauth2.googleapis.com/token",
         client_id=settings.google_client_id,
         client_secret=settings.google_client_secret,
