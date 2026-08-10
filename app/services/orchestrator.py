@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
 
 from app.db.models import FixedEventOverride, Item, User
-from app.services import calendar
+from app.services import calendar, scheduler_jobs
 from app.services.parser import ExplicitTimeItem, ParsedMessage, ReminderItem, RecurringTaskItem, TaskItem
 from app.services.scheduler import (
     BusyBlock,
@@ -211,7 +211,7 @@ def build_plan(db: Session, user_id: int, target_date: date_, parsed: ParsedMess
             start = datetime.combine(target_date, time_(hh, mm))
             duration = item.duration_minutes or DEFAULT_RECURRING_DURATION_MINUTES
             end = start + timedelta(minutes=duration)
-            result = place_explicit_time_item(target_date, item.title, start, end, blocks)
+            result = place_explicit_time_item(target_date, item.title, start, end, blocks, important=item.important)
             if isinstance(result, CollisionResult):
                 plan.pending_collisions.append(result)
             else:
@@ -230,7 +230,9 @@ def build_plan(db: Session, user_id: int, target_date: date_, parsed: ParsedMess
         elif t.duration_minutes is None:
             plan.pending_duration_questions.append(t)
         else:
-            task_requests.append(UntimedTaskRequest(t.title, t.duration_minutes, t.time_of_day_preference, t.urgent))
+            task_requests.append(
+                UntimedTaskRequest(t.title, t.duration_minutes, t.time_of_day_preference, t.urgent, t.important)
+            )
 
     if task_requests:
         wake_dt = datetime.combine(target_date, user.wake_time)
@@ -274,8 +276,6 @@ def route_message(
             items_by_date[reference_date].append(item)
 
     return {d: build_plan(db, user_id, d, ParsedMessage(items=items)) for d, items in sorted(items_by_date.items())}
-
-    return plan
 
 
 def resolve_collision(
@@ -398,6 +398,43 @@ def remove_item(plan: Plan, title: str) -> bool:
     return False
 
 
+def _place_single_task(
+    user: User,
+    target_date: date_,
+    blocks: list[BusyBlock],
+    title: str,
+    duration_minutes: int,
+    time_of_day_preference: Optional[str] = None,
+    urgent: bool = False,
+    important: bool = False,
+    min_start: Optional[datetime] = None,
+) -> Placement | NoFitResult:
+    """Shared core behind both reschedule_item (pre-confirm, Plan-level)
+    and reschedule_confirmed_item (post-confirm, DB-level) - the actual
+    gap-search is identical either way, only what happens with the result
+    differs.
+
+    min_start raises the lower search bound above wake_time when needed -
+    critically, for a same-day reschedule happening in real time (e.g. the
+    completion check-in's "no" answer), gap-finding is otherwise blind to
+    the actual current time and can happily place the new slot earlier
+    today than "now", which is meaningless (you can't do a task in the
+    past) and silently produces a nudge/check-in that never gets
+    scheduled, since their own run_date-in-the-past check correctly
+    refuses. reschedule_confirmed_item passes real "now" here for today;
+    every other caller leaves this None since they only ever deal with
+    already-resolved future dates from the parser, where "now" is
+    irrelevant."""
+    wake_dt = datetime.combine(target_date, user.wake_time)
+    if min_start is not None and min_start > wake_dt:
+        wake_dt = min_start
+    sleep_dt = datetime.combine(target_date, user.sleep_time)
+    placements, no_fits, _ = place_untimed_tasks(
+        blocks, wake_dt, sleep_dt, [UntimedTaskRequest(title, duration_minutes, time_of_day_preference, urgent, important)]
+    )
+    return placements[0] if placements else no_fits[0]
+
+
 def reschedule_item(
     db: Session,
     plan: Plan,
@@ -411,26 +448,93 @@ def reschedule_item(
     'change its time' means a new message with a new stated time, not
     auto-fit re-placement. Returns a NoFitResult if the new constraints
     genuinely don't fit anywhere (item is dropped from the plan in that
-    case - same as any other no-fit)."""
+    case - same as any other no-fit).
+
+    Nothing is persisted until confirm_plan runs, so there is never a live
+    nudge/check-in job to cancel here - those only get scheduled once an
+    item has a real DB row and start_time (see confirm_plan). The
+    equivalent post-confirm operation, which does need to cancel/
+    reschedule real jobs, is reschedule_confirmed_item below."""
     existing = next((p for p in plan.task_placements if p.title == title), None)
     if existing is None:
         raise ValueError(f"'{title}' isn't an untimed task placement in this plan")
 
     plan.task_placements.remove(existing)
     duration = new_duration_minutes or int((existing.end - existing.start).total_seconds() // 60)
-
     user = db.get(User, plan.user_id)
-    wake_dt = datetime.combine(plan.target_date, user.wake_time)
-    sleep_dt = datetime.combine(plan.target_date, user.sleep_time)
     blocks = _current_plan_blocks(db, plan)  # existing was already removed above, so its old slot is free
 
-    placements, no_fits, _ = place_untimed_tasks(
-        blocks, wake_dt, sleep_dt, [UntimedTaskRequest(title, duration, new_time_of_day_preference)]
+    result = _place_single_task(
+        user, plan.target_date, blocks, title, duration, new_time_of_day_preference, important=existing.important
     )
-    plan.task_placements.extend(placements)
-    if no_fits:
-        plan.pending_no_fits.extend(no_fits)
-        return no_fits[0]
+    if isinstance(result, NoFitResult):
+        plan.pending_no_fits.append(result)
+        return result
+    plan.task_placements.append(result)
+    return None
+
+
+def reschedule_confirmed_item(db: Session, item_id: int, new_time_of_day_preference: Optional[str] = None) -> Optional[NoFitResult]:
+    """Post-confirm reschedule - used by the completion check-in's 'no,
+    didn't get to it' answer (scheduler_jobs.answer_checkin), reusing the
+    same _place_single_task core as reschedule_item rather than a second
+    placement path. This is the code path that actually needs to cancel a
+    live nudge/check-in job and schedule fresh ones for the new time."""
+    item = db.get(Item, item_id)
+    if item is None:
+        raise ValueError(f"Item {item_id} not found")
+    if item.type != "task":
+        raise ValueError(f"Item {item_id} is a {item.type!r}, not a reschedulable task")
+
+    user = db.get(User, item.user_id)
+    tz = ZoneInfo(user.timezone)
+    target_date = item.start_time.astimezone(tz).date()
+    duration_minutes = int((item.end_time - item.start_time).total_seconds() // 60)
+
+    scheduler_jobs.cancel_job(item.nudge_job_id)
+    scheduler_jobs.cancel_job(item.checkin_job_id)
+    item.nudge_job_id = None
+    item.checkin_job_id = None
+
+    now_local = datetime.now(tz).replace(tzinfo=None)
+    min_start = now_local if target_date == now_local.date() else None
+
+    blocks = [b for b in get_effective_schedule(db, item.user_id, target_date) if b.item_id != item.id]
+    result = _place_single_task(
+        user, target_date, blocks, item.title, duration_minutes, new_time_of_day_preference,
+        important=item.important, min_start=min_start,
+    )
+
+    if isinstance(result, NoFitResult):
+        db.commit()
+        return result
+
+    item.start_time = result.start.replace(tzinfo=tz)
+    item.end_time = result.end.replace(tzinfo=tz)
+
+    if item.google_event_id:
+        try:
+            calendar.delete_event(db, item.user_id, item.google_event_id)
+        except Exception as exc:
+            print(f"  (calendar cleanup skipped: {exc})")
+
+    item.google_event_id = _sync_to_calendar_best_effort(
+        db,
+        item.user_id,
+        summary=item.title,
+        description="Rescheduled via Day Planner",
+        start_datetime=item.start_time.isoformat(),
+        end_datetime=item.end_time.isoformat(),
+        time_zone=user.timezone,
+    )
+
+    item.nudge_job_id = scheduler_jobs.schedule_nudge(
+        item.id, result.start - timedelta(minutes=user.nudge_lead_minutes), user.timezone
+    )
+    if item.important:
+        item.checkin_job_id = scheduler_jobs.schedule_checkin(item.id, result.end, user.timezone)
+
+    db.commit()
     return None
 
 
@@ -483,6 +587,7 @@ def confirm_plan(db: Session, plan: Plan) -> list[Item]:
             title=placement.title,
             start_time=to_aware(placement.start),
             end_time=to_aware(placement.end),
+            important=placement.important,
         )
         db.add(row)
         db.flush()  # get row.id before splitting overrides / calling Calendar
@@ -521,6 +626,15 @@ def confirm_plan(db: Session, plan: Plan) -> list[Item]:
             end_datetime=to_aware(placement.end).isoformat(),
             time_zone=user.timezone,
         )
+
+        # Nudge applies to any scheduled task with a specific time, not just
+        # important-flagged ones. Check-in is opt-in, important-only.
+        row.nudge_job_id = scheduler_jobs.schedule_nudge(
+            row.id, placement.start - timedelta(minutes=user.nudge_lead_minutes), user.timezone
+        )
+        if placement.important:
+            row.checkin_job_id = scheduler_jobs.schedule_checkin(row.id, placement.end, user.timezone)
+
         saved.append(row)
 
     for group in plan.recurring_groups:
@@ -546,6 +660,21 @@ def confirm_plan(db: Session, plan: Plan) -> list[Item]:
             time_zone=user.timezone,
             recurrence=[f"RRULE:{rrule}"],
         )
+
+        # Nudges extend to newly-confirmed fixed events too (per spec:
+        # "any scheduled task or fixed event with a specific time"), via a
+        # recurring CronTrigger matching the group's days. Pre-existing
+        # seeded fixed events (Gym/Office/etc, never created through
+        # confirm_plan) deliberately don't get this - no natural hook.
+        nudge_time = (group.start - timedelta(minutes=user.nudge_lead_minutes)).time()
+        row.nudge_job_id = scheduler_jobs.schedule_recurring_nudge(
+            row.id, group.days, nudge_time.hour, nudge_time.minute, user.timezone
+        )
+        # Recurring tasks/fixed events don't get a completion check-in -
+        # "did you do it today" doesn't fit an ongoing habit the way it
+        # fits a one-off task; important-flagging isn't offered on
+        # RecurringTaskItem at the parser level either (see parser.py).
+
         saved.append(row)
 
     for reminder in plan.reminders:

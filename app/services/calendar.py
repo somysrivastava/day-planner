@@ -71,3 +71,9 @@ def create_event(
         event_body["recurrence"] = recurrence  # e.g. ["RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"]
 
     return service.events().insert(calendarId="primary", body=event_body).execute()
+
+
+def delete_event(db: Session, user_id: int, event_id: str) -> None:
+    creds = _get_credentials_for_user(db, user_id)
+    service = build("calendar", "v3", credentials=creds)
+    service.events().delete(calendarId="primary", eventId=event_id).execute()

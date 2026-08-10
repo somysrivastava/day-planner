@@ -50,6 +50,7 @@ class Placement:
     start: datetime
     end: datetime
     fixed_event_splits: list[FixedEventSplit] = field(default_factory=list)
+    important: bool = False  # opt-in completion check-in after scheduled time passes (Day 5)
 
 
 @dataclass
@@ -199,6 +200,7 @@ class UntimedTaskRequest:
     duration_minutes: int
     time_of_day_preference: Optional[str] = None
     urgent: bool = False
+    important: bool = False
 
 
 def place_untimed_tasks(
@@ -235,7 +237,7 @@ def place_untimed_tasks(
 
         start = fit[0]
         end = start + duration
-        placements.append(Placement(req.title, start, end))
+        placements.append(Placement(req.title, start, end, important=req.important))
         blocks.append(BusyBlock(start, end, req.title, "task"))
         blocks.sort(key=lambda b: b.start)
 
@@ -262,6 +264,7 @@ def place_explicit_time_item(
     start: datetime,
     end: datetime,
     busy_blocks: list[BusyBlock],
+    important: bool = False,
 ) -> Placement | CollisionResult:
     """Part 2: places an item with an explicit clock time.
 
@@ -291,4 +294,4 @@ def place_explicit_time_item(
         segments = _compute_split_segments(block.start, block.end, start, end)
         splits.append(FixedEventSplit(block.item_id, block.title, target_date, segments))
 
-    return Placement(title, start, end, fixed_event_splits=splits)
+    return Placement(title, start, end, fixed_event_splits=splits, important=important)

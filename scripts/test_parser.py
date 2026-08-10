@@ -23,6 +23,8 @@ TEST_MESSAGES = [
     "gotta submit the report by fri, need like an hour",
     "dentist appointment 3:30-4:15pm thursday",
     "I need to pick up my dress and read for 30 minutes daily starting today",
+    "this is important - call the insurance company today, 20 minutes",
+    "mark as important: submit the visa application at 3pm",
 ]
 
 

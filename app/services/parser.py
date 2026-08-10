@@ -31,6 +31,7 @@ class TaskItem(BaseModel):
     duration_minutes: Optional[int] = None
     time_of_day_preference: Optional[TimeOfDay] = None
     urgent: bool = False
+    important: bool = False  # opt-in completion check-in after scheduled time passes (Day 5)
     needs_clarification: bool = False  # true only if BOTH day and duration are absent
 
 
@@ -61,6 +62,7 @@ class ExplicitTimeItem(BaseModel):
     date: str  # ISO 8601 date; assume the reference date if none stated
     start_time: str  # "HH:MM" 24-hour
     duration_minutes: Optional[int] = None
+    important: bool = False  # opt-in completion check-in after scheduled time passes (Day 5)
 
 
 ParsedItem = Union[ReminderItem, TaskItem, RecurringTaskItem, ExplicitTimeItem]
@@ -84,7 +86,7 @@ Classify each distinct thing the user mentions as exactly one of:
 - recurring_task: daily or day-specific repeating language ("every day", "read Mon/Wed/Fri"). If the message describes one repeating commitment, return it as a single recurring_task item, even if the time differs by day - list every applicable weekday in `days` and each day's time (or null if still needs asking) in `times`. Do not split one commitment into multiple recurring_task items.
 - explicit_time_item: the user gave a specific clock time (e.g. "at 2pm", "2-3pm"). This skips all scheduling logic - record the date (assume the reference date if none stated) and time only.
 
-Extract, only where the field applies to that type: whether the user flagged the item as urgent ("this one's urgent"), and a vague time-of-day preference (morning/afternoon/evening) if stated.
+Extract, only where the field applies to that type: whether the user flagged the item as urgent ("this one's urgent") - affects which gap it gets during scheduling; whether the user flagged it as important ("this is important", "mark as important", "flag this") - a completely separate concept from urgent, triggers a check-in after the scheduled time asking if it got done; and a vague time-of-day preference (morning/afternoon/evening) if stated.
 
 If the message contains multiple distinct items, return one entry per item, in the order the user mentioned them."""
 

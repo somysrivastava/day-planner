@@ -1,6 +1,6 @@
 from datetime import date, datetime, time
 
-from sqlalchemy import Boolean, CheckConstraint, Date, ForeignKey, String, Text, TIMESTAMP, Time, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Date, ForeignKey, Integer, String, Text, TIMESTAMP, Time, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -17,6 +17,7 @@ class User(Base):
     google_refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     wake_time: Mapped[time] = mapped_column(Time, nullable=False, server_default="06:00:00")
     sleep_time: Mapped[time] = mapped_column(Time, nullable=False, server_default="23:00:00")
+    nudge_lead_minutes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="30")
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
 
 
@@ -36,6 +37,16 @@ class Item(Base):
     end_time: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     recurrence_rule: Mapped[str | None] = mapped_column(Text, nullable=True)
     google_event_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Opt-in completion check-in (Day 5): only tasks/explicit-time items the
+    # user explicitly flags "important" get a check-in after their scheduled
+    # time passes. checkin_waiting is true from when the check-in fires
+    # until it's answered - see app/services/scheduler_jobs.py.
+    important: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    checkin_waiting: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # APScheduler job ids so a nudge/check-in can be found and cancelled
+    # if this item gets rescheduled - see reschedule_confirmed_item().
+    nudge_job_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    checkin_job_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
 

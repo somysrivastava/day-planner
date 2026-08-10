@@ -6,3 +6,4 @@ __pycache__/
 .claude/
 docs/
 .DS_Store
+PROGRESS.md
