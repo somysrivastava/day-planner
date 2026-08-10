@@ -18,6 +18,7 @@ class User(Base):
     wake_time: Mapped[time] = mapped_column(Time, nullable=False, server_default="06:00:00")
     sleep_time: Mapped[time] = mapped_column(Time, nullable=False, server_default="23:00:00")
     nudge_lead_minutes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="30")
+    evening_checkin_time: Mapped[time] = mapped_column(Time, nullable=False, server_default="20:00:00")
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
 
 
@@ -43,6 +44,12 @@ class Item(Base):
     # until it's answered - see app/services/scheduler_jobs.py.
     important: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     checkin_waiting: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # Evening check-in (Day 7): true from when the nightly sweep flags this
+    # still-pending task until the user answers Tomorrow/Choose a date/leave
+    # it. A separate flag from checkin_waiting - that one is the Day 5
+    # single-item important-task check-in, this is the once-nightly batch
+    # sweep of everything else left over. See scheduler_jobs.py.
+    evening_checkin_flagged: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     # APScheduler job ids so a nudge/check-in can be found and cancelled
     # if this item gets rescheduled - see reschedule_confirmed_item().
     nudge_job_id: Mapped[str | None] = mapped_column(Text, nullable=True)

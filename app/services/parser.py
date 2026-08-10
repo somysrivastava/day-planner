@@ -88,7 +88,7 @@ Classify each distinct thing the user mentions as exactly one of:
 
 Extract, only where the field applies to that type: whether the user flagged the item as urgent ("this one's urgent") - affects which gap it gets during scheduling; whether the user flagged it as important ("this is important", "mark as important", "flag this") - a completely separate concept from urgent, triggers a check-in after the scheduled time asking if it got done; and a vague time-of-day preference (morning/afternoon/evening) if stated.
 
-If the message contains multiple distinct items, return one entry per item, in the order the user mentioned them."""
+If the message contains multiple distinct items, return one entry per item, in the order the user mentioned them. Each distinct real-world thing the user mentions must produce exactly ONE item, classified as whichever single type best fits - never emit two items (e.g. an explicit_time_item and a task, or two of the same type) for the same single thing just because it could arguably be read more than one way."""
 
 
 def parse_message(

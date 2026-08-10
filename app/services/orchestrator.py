@@ -191,6 +191,44 @@ def _promote_recurring_task(
     return groups, no_fits
 
 
+_DEDUPE_TYPE_PRIORITY = {"explicit_time_item": 0, "task": 1}  # lower wins - explicit time is more information
+
+
+def _dedupe_parsed_items(items: list) -> list:
+    """Narrow safeguard against a real, still-present parser non-
+    determinism (see PROGRESS.md's Day 7 notes): occasionally, one thing
+    the user mentioned comes back as two items in the same message - an
+    explicit_time_item plus a redundant task, or two explicit_time_items -
+    which would otherwise write two real bookings for one thing. Only
+    collapses when BOTH items are task/explicit_time_item AND share an
+    exact normalized title AND an identical *stated* duration_minutes
+    (never when duration is still None - that's a legitimately unresolved
+    task, not a duplicate, and collapsing it here would risk silently
+    dropping a real second task before its own duration question is even
+    asked). This deliberately doesn't touch reminder/recurring_task, or
+    same-title items with differing durations - narrow enough that two
+    genuinely different same-titled things in one message essentially
+    never accidentally collide, at the cost of not catching every possible
+    duplication shape the parser might produce."""
+    kept: list = []
+    seen: dict[tuple[str, int], int] = {}
+    for item in items:
+        item_type = getattr(item, "type", None)
+        duration = getattr(item, "duration_minutes", None)
+        if item_type not in _DEDUPE_TYPE_PRIORITY or duration is None:
+            kept.append(item)
+            continue
+        key = (item.title.strip().lower(), duration)
+        if key in seen:
+            idx = seen[key]
+            if _DEDUPE_TYPE_PRIORITY[item_type] < _DEDUPE_TYPE_PRIORITY[kept[idx].type]:
+                kept[idx] = item
+            continue
+        seen[key] = len(kept)
+        kept.append(item)
+    return kept
+
+
 def build_plan(db: Session, user_id: int, target_date: date_, parsed: ParsedMessage) -> Plan:
     """Part 3: routes each parsed item through the scheduler and assembles
     one plan for the whole message - explicit-time items first (they're
@@ -201,8 +239,9 @@ def build_plan(db: Session, user_id: int, target_date: date_, parsed: ParsedMess
 
     blocks = get_effective_schedule(db, user_id, target_date)
     plan = Plan(user_id=user_id, target_date=target_date, skip_notes=_skip_notes_for_date(db, user_id, target_date))
+    deduped_items = _dedupe_parsed_items(parsed.items)
 
-    for item in parsed.items:
+    for item in deduped_items:
         if isinstance(item, ExplicitTimeItem):
             if date_.fromisoformat(item.date) != target_date:
                 plan.out_of_scope_items.append((date_.fromisoformat(item.date), item))
@@ -220,7 +259,7 @@ def build_plan(db: Session, user_id: int, target_date: date_, parsed: ParsedMess
                 blocks.sort(key=lambda b: b.start)
 
     task_requests = []
-    for t in parsed.items:
+    for t in deduped_items:
         if not isinstance(t, TaskItem):
             continue
         if t.day is not None and date_.fromisoformat(t.day) != target_date:
@@ -235,13 +274,13 @@ def build_plan(db: Session, user_id: int, target_date: date_, parsed: ParsedMess
             )
 
     if task_requests:
-        wake_dt = datetime.combine(target_date, user.wake_time)
+        wake_dt = _effective_start_bound(user, target_date, datetime.combine(target_date, user.wake_time))
         sleep_dt = datetime.combine(target_date, user.sleep_time)
         placements, no_fits, blocks = place_untimed_tasks(blocks, wake_dt, sleep_dt, task_requests)
         plan.task_placements.extend(placements)
         plan.pending_no_fits.extend(no_fits)
 
-    for item in parsed.items:
+    for item in deduped_items:
         if isinstance(item, RecurringTaskItem):
             groups, no_fits = _promote_recurring_task(
                 db, user_id, item, target_date, blocks, user.wake_time, user.sleep_time
@@ -285,7 +324,7 @@ def resolve_collision(
     (WhatsApp reply / CLI prompt) supplies the user's choice."""
     plan.pending_collisions.remove(collision)
     user = db.get(User, plan.user_id)
-    wake_dt = datetime.combine(plan.target_date, user.wake_time)
+    wake_dt = _effective_start_bound(user, plan.target_date, datetime.combine(plan.target_date, user.wake_time))
     sleep_dt = datetime.combine(plan.target_date, user.sleep_time)
     current_blocks = _current_plan_blocks(db, plan)
 
@@ -326,8 +365,9 @@ def resolve_no_fit(
     user = db.get(User, plan.user_id)
     current_blocks = _current_plan_blocks(db, plan)
     # Forced: search the full day, not just wake-sleep bounds - the user is
-    # explicitly authorizing sleep-hour placement.
-    day_start = datetime.combine(plan.target_date, time_.min)
+    # explicitly authorizing sleep-hour placement. Still never into the
+    # past, though - "force it into today" can't mean before "now".
+    day_start = _effective_start_bound(user, plan.target_date, datetime.combine(plan.target_date, time_.min))
     day_end = datetime.combine(plan.target_date, time_.max)
     placements, still_no_fit, _ = place_untimed_tasks(
         current_blocks, day_start, day_end, [UntimedTaskRequest(no_fit.item_title, no_fit.duration_minutes or 30)]
@@ -342,11 +382,12 @@ def resolve_duration_question(db: Session, plan: Plan, task: TaskItem, duration_
     of the spec) - day and everything else was already known."""
     plan.pending_duration_questions.remove(task)
     user = db.get(User, plan.user_id)
-    wake_dt = datetime.combine(plan.target_date, user.wake_time)
+    wake_dt = _effective_start_bound(user, plan.target_date, datetime.combine(plan.target_date, user.wake_time))
     sleep_dt = datetime.combine(plan.target_date, user.sleep_time)
     blocks = _current_plan_blocks(db, plan)
     placements, no_fits, _ = place_untimed_tasks(
-        blocks, wake_dt, sleep_dt, [UntimedTaskRequest(task.title, duration_minutes, task.time_of_day_preference, task.urgent)]
+        blocks, wake_dt, sleep_dt,
+        [UntimedTaskRequest(task.title, duration_minutes, task.time_of_day_preference, task.urgent, task.important)],
     )
     plan.task_placements.extend(placements)
     plan.pending_no_fits.extend(no_fits)
@@ -366,11 +407,12 @@ def resolve_clarification(
     if day != plan.target_date:
         return f"'{task.title}' resolved to {day} - build a separate plan for that date"
     user = db.get(User, plan.user_id)
-    wake_dt = datetime.combine(plan.target_date, user.wake_time)
+    wake_dt = _effective_start_bound(user, plan.target_date, datetime.combine(plan.target_date, user.wake_time))
     sleep_dt = datetime.combine(plan.target_date, user.sleep_time)
     blocks = _current_plan_blocks(db, plan)
     placements, no_fits, _ = place_untimed_tasks(
-        blocks, wake_dt, sleep_dt, [UntimedTaskRequest(task.title, duration_minutes, time_of_day_preference, task.urgent)]
+        blocks, wake_dt, sleep_dt,
+        [UntimedTaskRequest(task.title, duration_minutes, time_of_day_preference, task.urgent, task.important)],
     )
     plan.task_placements.extend(placements)
     plan.pending_no_fits.extend(no_fits)
@@ -396,6 +438,26 @@ def remove_item(plan: Plan, title: str) -> bool:
             plan.reminders.remove(r)
             return True
     return False
+
+
+def _effective_start_bound(user: User, target_date: date_, floor_dt: datetime) -> datetime:
+    """Raises floor_dt (normally wake_time, or midnight for a forced no-fit
+    search) to real 'now' when target_date is today in the user's own
+    timezone and now has already passed floor_dt. Without this, a message
+    processed mid-day/evening with no explicit time preference gets
+    auto-fit-placed at the day's *earliest* gap regardless of when it's
+    actually being handled - e.g. a 9pm text with no time stated getting
+    placed at 4:30am, hours already in the past. Found via the Day 7
+    full-loop integration test (every earlier test used future seed dates,
+    where 'today' was always still ahead of real 'now' at test time, so
+    this was structurally invisible before). Same underlying fix as Day
+    5's reschedule_confirmed_item min_start, generalized to every call site
+    that places something for potentially-today rather than just that one."""
+    tz = ZoneInfo(user.timezone)
+    now_local = datetime.now(tz).replace(tzinfo=None)
+    if target_date == now_local.date() and now_local > floor_dt:
+        return now_local
+    return floor_dt
 
 
 def _place_single_task(
@@ -463,9 +525,14 @@ def reschedule_item(
     duration = new_duration_minutes or int((existing.end - existing.start).total_seconds() // 60)
     user = db.get(User, plan.user_id)
     blocks = _current_plan_blocks(db, plan)  # existing was already removed above, so its old slot is free
+    # Passing this unconditionally is harmless when it equals wake_time
+    # exactly - _place_single_task only raises the floor if min_start is
+    # later than wake_dt.
+    min_start = _effective_start_bound(user, plan.target_date, datetime.combine(plan.target_date, user.wake_time))
 
     result = _place_single_task(
-        user, plan.target_date, blocks, title, duration, new_time_of_day_preference, important=existing.important
+        user, plan.target_date, blocks, title, duration, new_time_of_day_preference,
+        important=existing.important, min_start=min_start,
     )
     if isinstance(result, NoFitResult):
         plan.pending_no_fits.append(result)
@@ -474,12 +541,23 @@ def reschedule_item(
     return None
 
 
-def reschedule_confirmed_item(db: Session, item_id: int, new_time_of_day_preference: Optional[str] = None) -> Optional[NoFitResult]:
-    """Post-confirm reschedule - used by the completion check-in's 'no,
-    didn't get to it' answer (scheduler_jobs.answer_checkin), reusing the
-    same _place_single_task core as reschedule_item rather than a second
+def reschedule_confirmed_item(
+    db: Session, item_id: int, new_time_of_day_preference: Optional[str] = None, target_date: Optional[date_] = None
+) -> Optional[NoFitResult]:
+    """Post-confirm reschedule - used by both the completion check-in's
+    'no, didn't get to it' answer (scheduler_jobs.answer_checkin) and the
+    Day 7 evening check-in's 'tomorrow'/'choose a date' deferral
+    (scheduler_jobs.answer_evening_checkin), reusing the same
+    _place_single_task core as reschedule_item rather than a second
     placement path. This is the code path that actually needs to cancel a
-    live nudge/check-in job and schedule fresh ones for the new time."""
+    live nudge/check-in job and schedule fresh ones for the new time.
+
+    target_date defaults to the item's own current date (the completion
+    check-in's use case - reschedule later the same day or the search
+    naturally spills to whatever's passed in). The evening check-in passes
+    an explicit future date instead, since by definition it's deferring an
+    already-past-today item to tomorrow or a chosen date, not re-searching
+    today (which has already ended for that item's purposes)."""
     item = db.get(Item, item_id)
     if item is None:
         raise ValueError(f"Item {item_id} not found")
@@ -488,7 +566,8 @@ def reschedule_confirmed_item(db: Session, item_id: int, new_time_of_day_prefere
 
     user = db.get(User, item.user_id)
     tz = ZoneInfo(user.timezone)
-    target_date = item.start_time.astimezone(tz).date()
+    if target_date is None:
+        target_date = item.start_time.astimezone(tz).date()
     duration_minutes = int((item.end_time - item.start_time).total_seconds() // 60)
 
     scheduler_jobs.cancel_job(item.nudge_job_id)
@@ -496,8 +575,7 @@ def reschedule_confirmed_item(db: Session, item_id: int, new_time_of_day_prefere
     item.nudge_job_id = None
     item.checkin_job_id = None
 
-    now_local = datetime.now(tz).replace(tzinfo=None)
-    min_start = now_local if target_date == now_local.date() else None
+    min_start = _effective_start_bound(user, target_date, datetime.combine(target_date, user.wake_time))
 
     blocks = [b for b in get_effective_schedule(db, item.user_id, target_date) if b.item_id != item.id]
     result = _place_single_task(

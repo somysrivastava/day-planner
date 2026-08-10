@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Optional
+from datetime import date as date_
+from datetime import datetime, timedelta
+from typing import Literal, Optional
 from zoneinfo import ZoneInfo
 
 from apscheduler.jobstores.base import JobLookupError
@@ -124,6 +125,124 @@ def schedule_checkin(item_id: int, run_date: datetime, timezone: str) -> Optiona
         replace_existing=True,
     )
     return job_id
+
+
+def schedule_evening_checkin(user_id: int, hour: int, minute: int, timezone: str) -> str:
+    """Recurring daily evening check-in trigger for this user - one job per
+    user (id 'evening-checkin-{user_id}'), not per item like nudge/checkin,
+    since it's a once-nightly sweep of everything still pending that day,
+    not tied to a single item's lifecycle."""
+    job_id = f"evening-checkin-{user_id}"
+    get_scheduler().add_job(
+        _fire_evening_checkin,
+        trigger=CronTrigger(hour=hour, minute=minute, timezone=timezone),
+        args=[user_id],
+        id=job_id,
+        replace_existing=True,
+    )
+    return job_id
+
+
+def _fire_evening_checkin(user_id: int) -> list[int]:
+    """Sweeps today's task items whose scheduled time has already passed
+    and are still status='pending', and flags each for a deferral answer.
+    Deliberately excludes: items not yet due today (their window hasn't
+    passed yet - not 'left over' yet, just not reached), and items with
+    checkin_waiting=True (already mid the separate Day 5 important-task
+    check-in flow - avoid asking about the same item through two different
+    flows in one evening). Returns the flagged item ids - useful for tests/
+    the CLI, not just the print-based delivery stub."""
+    from app.db.models import Item, User
+
+    db = SessionLocal()
+    try:
+        user = db.get(User, user_id)
+        if user is None:
+            return []
+        tz = ZoneInfo(user.timezone)
+        now_local = datetime.now(tz).replace(tzinfo=None)
+        today_local = now_local.date()
+
+        candidates = (
+            db.query(Item)
+            .filter(
+                Item.user_id == user_id,
+                Item.type == "task",
+                Item.status == "pending",
+                Item.checkin_waiting.is_(False),
+                Item.start_time.isnot(None),
+                Item.end_time.isnot(None),
+            )
+            .all()
+        )
+        pending_today = [
+            item
+            for item in candidates
+            if item.start_time.astimezone(tz).replace(tzinfo=None).date() == today_local
+            and item.end_time.astimezone(tz).replace(tzinfo=None) <= now_local
+        ]
+
+        if not pending_today:
+            print("[EVENING CHECK-IN] nothing left over today - skipping silently, no message sent")
+            return []
+
+        for item in pending_today:
+            item.evening_checkin_flagged = True
+        db.commit()
+
+        titles = ", ".join(f"'{i.title}'" for i in pending_today)
+        print(
+            f"[EVENING CHECK-IN] Anything left over from today you want on tomorrow's list? "
+            f"Still pending: {titles}"
+        )
+        return [i.id for i in pending_today]
+    finally:
+        db.close()
+
+
+def answer_evening_checkin(
+    db,
+    item_id: int,
+    choice: Literal["tomorrow", "choose_date", "keep_pending"],
+    chosen_date: Optional[date_] = None,
+):
+    """Answers one item from a flagged evening check-in. 'tomorrow'/
+    'choose_date' reuse orchestrator.reschedule_confirmed_item (same
+    mechanism as the completion check-in's 'no' answer, per spec) - just
+    with an explicit target_date instead of letting it default to the
+    item's own (already-past) date. 'keep_pending' just clears the flag
+    and leaves the item exactly where it is - the spec doesn't define a
+    separate 'missed' state, so an item left this way simply sits as
+    status='pending' at its original past time until the user brings it up
+    again (see PROGRESS.md's Day 7 known-limitations note)."""
+    from app.db.models import Item, User
+
+    item = db.get(Item, item_id)
+    if item is None:
+        raise ValueError(f"Item {item_id} not found")
+    if not item.evening_checkin_flagged:
+        raise ValueError(f"Item {item_id} has no evening check-in currently waiting for an answer")
+
+    item.evening_checkin_flagged = False
+    db.commit()
+
+    if choice == "keep_pending":
+        return None
+
+    from app.services.orchestrator import reschedule_confirmed_item  # local import breaks the circular dependency
+
+    if choice == "tomorrow":
+        user = db.get(User, item.user_id)
+        tz = ZoneInfo(user.timezone)
+        target = item.start_time.astimezone(tz).replace(tzinfo=None).date() + timedelta(days=1)
+    elif choice == "choose_date":
+        if chosen_date is None:
+            raise ValueError("chosen_date is required when choice='choose_date'")
+        target = chosen_date
+    else:
+        raise ValueError(f"Unknown choice {choice!r}")
+
+    return reschedule_confirmed_item(db, item_id, target_date=target)
 
 
 def answer_checkin(db, item_id: int, done: bool):
