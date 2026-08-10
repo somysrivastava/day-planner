@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     google_client_secret: str
     openai_api_key: str
     token_encryption_key: str
+    groq_api_key: str
+    google_tts_api_key: str
 
 
 settings = Settings()
