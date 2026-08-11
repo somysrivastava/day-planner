@@ -176,6 +176,25 @@ def main():
     assert proposal.start_time.astimezone(tz) >= now_local, "must never reschedule into the past (Day 5's min_start fix)"
     print(f"  proposal rescheduled: {old_proposal_start} -> {proposal.start_time}")
 
+    section(f"Backdating 'quick call' and 'team sync' too, so the evening sweep isn't time-of-day dependent (ids={quickcall.id},{teamsync.id})")
+    # These were added via hardcoded clock times in the message text
+    # ("...at 7:30pm"/"...at 8pm"), which only land in the real past if this
+    # script happens to run in the evening - true when Day 7 was originally
+    # built and tested, but not guaranteed for every future run (found via
+    # Week 2 Day 4's broader regression pass: running this script at 8:33am
+    # left both still in the future relative to real "now", so the evening
+    # sweep correctly did NOT flag them - correct product behavior, but a
+    # silently time-dependent test assumption, not a real bug). Backdating
+    # explicitly here, same as slides/proposal above, makes the test's
+    # outcome independent of what time of day it's actually run.
+    quickcall.start_time = now_local - timedelta(minutes=90)
+    quickcall.end_time = now_local - timedelta(minutes=80)
+    teamsync.start_time = now_local - timedelta(minutes=60)
+    teamsync.end_time = now_local - timedelta(minutes=45)
+    db.commit()
+    print(f"  backdated quickcall: start={quickcall.start_time} end={quickcall.end_time}")
+    print(f"  backdated teamsync: start={teamsync.start_time} end={teamsync.end_time}")
+
     section("Evening check-in fires - should sweep up everything still pending and already past")
     cli.dispatch_command(sess, ":evening")
     db.refresh(slides)

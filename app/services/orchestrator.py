@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from calendar import monthrange
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -15,6 +16,8 @@ from sqlalchemy.orm import Session
 from app.db.models import FixedEventOverride, Item, User
 from app.services import calendar, scheduler_jobs
 from app.services.parser import ExplicitTimeItem, ParsedMessage, ReminderItem, RecurringTaskItem, TaskItem
+
+logger = logging.getLogger(__name__)
 from app.services.scheduler import (
     BusyBlock,
     CollisionResult,
@@ -116,6 +119,12 @@ class Plan:
     # A recurring reminder anchored on the 29th/30th/31st - see
     # MonthLengthWarning. Resolved via resolve_month_length_warning().
     pending_month_length_warnings: list[MonthLengthWarning] = field(default_factory=list)
+    # A reminder whose stated day-of-month doesn't resolve to a real day at
+    # all (e.g. "the 0th") - parser.ReminderItem.needs_clarification=true.
+    # Distinct from MonthLengthWarning (a real day, just short-month-
+    # skipping) - this is "not a real day at all," never silently guessed
+    # at. Resolved via resolve_reminder_clarification().
+    pending_reminder_clarifications: list[ReminderItem] = field(default_factory=list)
     # Items resolved to a different date than this plan's target_date - a
     # single build_plan call only schedules one date. Carries the actual
     # item (not just a note) so a caller can act on it - route_message()
@@ -132,6 +141,7 @@ class Plan:
             or self.pending_duration_questions
             or self.pending_clarifications
             or self.pending_month_length_warnings
+            or self.pending_reminder_clarifications
         )
 
     def summary_text(self) -> str:
@@ -162,6 +172,9 @@ class Plan:
                     f"  (heads up: '{w.reminder.title}' is set for the {_ordinal(day)} - won't fire in "
                     f"shorter months like February. Keep it as-is, or adjust it?)"
                 )
+        if self.pending_reminder_clarifications:
+            for r in self.pending_reminder_clarifications:
+                lines.append(f"  (need a real date: '{r.title}' - what day did you mean?)")
         if self.pending_collisions:
             lines.append(f"  ({len(self.pending_collisions)} collision(s) still need your input)")
         if self.pending_no_fits:
@@ -208,6 +221,38 @@ def skip_fixed_event(db: Session, user_id: int, target_date: date_, title: str) 
     db.commit()
 
 
+def _safe_parse_date(date_str: str, context: str) -> Optional[date_]:
+    """Parser output should always be a real ISO date, but the LLM has been
+    observed (Week 2 Day 4 fuzz testing) to occasionally take a user
+    literally and produce a calendar-invalid one - e.g. 'February 30th'
+    becomes the string '2026-02-30', which date.fromisoformat itself
+    rejects with a ValueError (it validates real calendar validity, not
+    just YYYY-MM-DD shape). Logged and returns None instead of crashing
+    whatever loop is walking parsed items - callers are responsible for
+    skipping the item on None, same degrade-gracefully posture as
+    _parse_hhmm below."""
+    try:
+        return date_.fromisoformat(date_str)
+    except (ValueError, TypeError):
+        logger.warning("Parser produced an invalid date string %r (%s) - skipping this item", date_str, context)
+        return None
+
+
+def _parse_hhmm(time_str: str) -> Optional[tuple[int, int]]:
+    """Returns (hour, minute) for a well-formed 'HH:MM' string, or None for
+    anything else - including the malformed-but-schema-valid strings the
+    parser has been observed to occasionally emit (e.g. the literal word
+    'morning' or the literal string 'null' instead of a real time or JSON
+    null; see PROGRESS.md's Week 2 Day 4 notes). Never raises."""
+    try:
+        hh, mm = map(int, time_str.split(":"))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return hh, mm
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
 def _promote_recurring_task(
     db: Session,
     user_id: int,
@@ -221,20 +266,32 @@ def _promote_recurring_task(
     no_fits: list[NoFitResult] = []
     duration = item.duration_minutes or DEFAULT_RECURRING_DURATION_MINUTES
 
-    # Days with an explicit time need no gap search - group identical times together.
+    # Days with an explicit, well-formed time need no gap search - group
+    # identical times together. A malformed time string is logged and
+    # routed to auto-fit instead of crashing - degrade gracefully rather
+    # than losing the whole plan to one bad field on one day.
     by_time: dict[str, list[str]] = defaultdict(list)
+    auto_days: list[str] = [t.day for t in item.times if t.time is None]
     for t in item.times:
-        if t.time is not None:
-            by_time[t.time].append(t.day)
+        if t.time is None:
+            continue
+        if _parse_hhmm(t.time) is None:
+            logger.warning(
+                "Recurring task %r got a malformed time %r for day=%s (expected 'HH:MM') - "
+                "routing to auto-fit instead of crashing",
+                item.title, t.time, t.day,
+            )
+            auto_days.append(t.day)
+            continue
+        by_time[t.time].append(t.day)
     for time_str, days in by_time.items():
-        hh, mm = map(int, time_str.split(":"))
+        hh, mm = _parse_hhmm(time_str)  # already validated above
         anchor_date = _next_occurrence_date(target_date, days)
         start = datetime.combine(anchor_date, time_(hh, mm))
         groups.append(RecurringGroup(item.title, days, start, start + timedelta(minutes=duration)))
 
     # Days needing auto-fit: search against the next actual occurrence of
     # those specific days, not blindly against target_date.
-    auto_days = [t.day for t in item.times if t.time is None]
     if auto_days:
         rep_date = _next_occurrence_date(target_date, auto_days)
         rep_blocks = blocks if rep_date == target_date else get_effective_schedule(db, user_id, rep_date)
@@ -306,10 +363,28 @@ def build_plan(db: Session, user_id: int, target_date: date_, parsed: ParsedMess
 
     for item in deduped_items:
         if isinstance(item, ExplicitTimeItem):
-            if date_.fromisoformat(item.date) != target_date:
-                plan.out_of_scope_items.append((date_.fromisoformat(item.date), item))
+            item_date = _safe_parse_date(item.date, f"ExplicitTimeItem.date for {item.title!r}")
+            if item_date is None:
+                continue  # malformed date - logged, item dropped rather than crashing the whole plan
+            if item_date != target_date:
+                plan.out_of_scope_items.append((item_date, item))
                 continue
-            hh, mm = map(int, item.start_time.split(":"))
+            parsed_hhmm = _parse_hhmm(item.start_time)
+            if parsed_hhmm is None:
+                # No clean fallback for an explicitly-stated-but-garbage
+                # time (unlike an untimed task, there's nothing to auto-fit
+                # around) - dropped with a loud log rather than crashing.
+                # Deliberately not wired into a pending-question flow: this
+                # is adversarial-input territory (e.g. "25:00", "9:99pm"),
+                # not a realistic real-world typo, so a full UX flow for it
+                # isn't built - see PROGRESS.md's Week 2 Day 4 fuzz-testing
+                # notes if this assumption ever turns out to be wrong.
+                logger.warning(
+                    "ExplicitTimeItem %r has an unparseable start_time %r - dropping this item",
+                    item.title, item.start_time,
+                )
+                continue
+            hh, mm = parsed_hhmm
             start = datetime.combine(target_date, time_(hh, mm))
             duration = item.duration_minutes or DEFAULT_RECURRING_DURATION_MINUTES
             end = start + timedelta(minutes=duration)
@@ -325,9 +400,14 @@ def build_plan(db: Session, user_id: int, target_date: date_, parsed: ParsedMess
     for t in deduped_items:
         if not isinstance(t, TaskItem):
             continue
-        if t.day is not None and date_.fromisoformat(t.day) != target_date:
-            plan.out_of_scope_items.append((date_.fromisoformat(t.day), t))
-        elif t.needs_clarification:
+        if t.day is not None:
+            t_day = _safe_parse_date(t.day, f"TaskItem.day for {t.title!r}")
+            if t_day is None:
+                continue  # malformed date - logged, item dropped rather than crashing the whole plan
+            if t_day != target_date:
+                plan.out_of_scope_items.append((t_day, t))
+                continue
+        if t.needs_clarification:
             plan.pending_clarifications.append(t)
         elif t.duration_minutes is None:
             plan.pending_duration_questions.append(t)
@@ -351,9 +431,19 @@ def build_plan(db: Session, user_id: int, target_date: date_, parsed: ParsedMess
             plan.recurring_groups.extend(groups)
             plan.pending_no_fits.extend(no_fits)
         elif isinstance(item, ReminderItem):
+            if item.needs_clarification:
+                # A day-of-month that isn't a real day at all (e.g. "the
+                # 0th") - the parser is instructed not to silently round
+                # this to a nearby valid day, so `item.date` is a
+                # placeholder here, not trusted. Ask, don't guess.
+                plan.pending_reminder_clarifications.append(item)
+                continue
             if item.last_day_of_month:
                 item = _resolve_last_day_of_month_item(item, target_date)
-            if item.recurring and not item.last_day_of_month and date_.fromisoformat(item.date).day >= 29:
+            reminder_date = _safe_parse_date(item.date, f"ReminderItem.date for {item.title!r}")
+            if reminder_date is None:
+                continue  # malformed date (e.g. a calendar-invalid "February 30th") - logged, dropped
+            if item.recurring and not item.last_day_of_month and reminder_date.day >= 29:
                 plan.pending_month_length_warnings.append(MonthLengthWarning(item))
             else:
                 plan.reminders.append(item)
@@ -375,10 +465,18 @@ def route_message(
 
     for item in parsed.items:
         if isinstance(item, TaskItem):
-            d = date_.fromisoformat(item.day) if item.day else reference_date
+            if item.day:
+                d = _safe_parse_date(item.day, f"TaskItem.day for {item.title!r}")
+                if d is None:
+                    continue  # malformed date - logged, item dropped rather than crashing
+            else:
+                d = reference_date
             items_by_date[d].append(item)
         elif isinstance(item, ExplicitTimeItem):
-            items_by_date[date_.fromisoformat(item.date)].append(item)
+            d = _safe_parse_date(item.date, f"ExplicitTimeItem.date for {item.title!r}")
+            if d is None:
+                continue
+            items_by_date[d].append(item)
         else:
             items_by_date[reference_date].append(item)
 
@@ -525,6 +623,35 @@ def resolve_month_length_warning(
         plan.reminders.append(reminder.model_copy(update={"date": resolved.isoformat(), "last_day_of_month": True}))
     else:
         raise ValueError(f"Unknown choice {choice!r}")
+
+
+def resolve_reminder_clarification(
+    plan: Plan, item: ReminderItem, date_str: str, last_day_of_month: bool = False
+) -> None:
+    """Answers a reminder whose stated day-of-month didn't resolve to a
+    real day at all (see ReminderItem.needs_clarification and
+    Plan.pending_reminder_clarifications) - the caller supplies a real
+    corrected date instead of the parser silently guessing one (rounding
+    '0th' to the 1st, or to the last day of the month, on its own - the
+    exact failure mode this exists to prevent). `last_day_of_month=True`
+    covers the plausible real answer "oh, I meant the last day of the
+    month" to the clarifying question.
+
+    Re-enters the same recurring/month-length-warning pipeline a normal
+    reminder goes through - a corrected recurring reminder that happens to
+    land on the 29th-31st still gets that separate warning too; resolving
+    one ambiguity shouldn't silently skip the other."""
+    plan.pending_reminder_clarifications.remove(item)
+    corrected = item.model_copy(
+        update={"date": date_str, "needs_clarification": False, "last_day_of_month": last_day_of_month}
+    )
+    if last_day_of_month:
+        corrected = _resolve_last_day_of_month_item(corrected, date_.fromisoformat(date_str))
+
+    if corrected.recurring and not corrected.last_day_of_month and date_.fromisoformat(corrected.date).day >= 29:
+        plan.pending_month_length_warnings.append(MonthLengthWarning(corrected))
+    else:
+        plan.reminders.append(corrected)
 
 
 def remove_item(plan: Plan, title: str) -> bool:
@@ -701,8 +828,14 @@ def reschedule_confirmed_item(
     if item.google_event_id:
         try:
             calendar.delete_event(db, item.user_id, item.google_event_id)
-        except Exception as exc:
-            print(f"  (calendar cleanup skipped: {exc})")
+        except Exception:
+            # item.google_event_id being set means sync previously
+            # succeeded, so this branch is always a genuine failure, never
+            # the expected no-account case - always worth a real log line.
+            logger.warning(
+                "Calendar cleanup failed for item_id=%s event_id=%s - old event may be orphaned",
+                item.id, item.google_event_id, exc_info=True,
+            )
 
     item.google_event_id = _sync_to_calendar_best_effort(
         db,
@@ -744,12 +877,27 @@ def _sync_to_calendar_best_effort(db: Session, user_id: int, **kwargs) -> Option
     a user with no Google Calendar connected (all 3 synthetic test users,
     or a real user who hasn't authorized yet) should still get their item
     saved to `items`. Returns the Google event id, or None if sync failed
-    for any reason."""
+    for any reason.
+
+    Week 2 Day 4: the two failure shapes are logged distinctly. No
+    connected account is `calendar._get_credentials_for_user` raising a
+    plain ValueError - expected, not a failure, logged at INFO. Anything
+    else (expired/revoked token, network error, Google API error) is a
+    genuine sync failure the item silently lost its calendar entry to -
+    logged at WARNING with the real exception, not swallowed to a one-line
+    print a developer would only ever see by having a terminal open at the
+    right moment."""
     try:
         event = calendar.create_event(db, user_id, **kwargs)
         return event["id"]
-    except Exception as exc:
-        print(f"  (calendar sync skipped: {exc})")
+    except ValueError:
+        logger.info("Calendar sync skipped for user_id=%s: no connected Google account", user_id)
+        return None
+    except Exception:
+        logger.warning(
+            "Calendar sync FAILED for user_id=%s title=%r - item saved without a calendar entry",
+            user_id, kwargs.get("summary"), exc_info=True,
+        )
         return None
 
 

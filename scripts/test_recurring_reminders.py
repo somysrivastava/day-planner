@@ -8,7 +8,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.db.base import SessionLocal  # noqa: E402
 from app.db.models import Item, User  # noqa: E402
 from app.services.briefing import _reminder_occurs_on, generate_briefing_text  # noqa: E402
-from app.services.orchestrator import build_plan, confirm_plan, resolve_month_length_warning  # noqa: E402
+from app.services.orchestrator import (  # noqa: E402
+    build_plan,
+    confirm_plan,
+    resolve_month_length_warning,
+    resolve_reminder_clarification,
+)
 from app.services.parser import parse_message  # noqa: E402
 from app.services.scheduler import get_effective_schedule  # noqa: E402
 
@@ -206,6 +211,54 @@ def main():
         other_day = 2 if expected_day == 5 else 5
         assert not _reminder_occurs_on(r, date(2026, 9, other_day), tz)
     print("  both fire independently and correctly across 3 months, and don't bleed into each other's day")
+
+    print("\n" + "=" * 70)
+    print("14. Nonsensical day-of-month ('the 0th') is flagged, never silently guessed")
+    print("=" * 70)
+    parsed_zero = parse_message("rent due on the 0th every month", reference_date=ref)
+    plan_zero = build_plan(db, uid, ref, parsed_zero)
+    print("plan_zero.pending_reminder_clarifications:", plan_zero.pending_reminder_clarifications)
+    assert plan_zero.has_pending_issues
+    assert len(plan_zero.pending_reminder_clarifications) == 1
+    assert not plan_zero.reminders, "must not be silently confirmed with a guessed date"
+    print(plan_zero.summary_text())
+
+    print("\n" + "=" * 70)
+    print("15. Resolving the clarification with a plain corrected date")
+    print("=" * 70)
+    item_zero = plan_zero.pending_reminder_clarifications[0]
+    resolve_reminder_clarification(plan_zero, item_zero, "2026-09-05")
+    assert not plan_zero.has_pending_issues
+    saved_zero = confirm_plan(db, plan_zero)
+    rent_zero = next(r for r in saved_zero if r.type == "reminder")
+    print(f"saved id={rent_zero.id} recurrence_rule={rent_zero.recurrence_rule!r} start_time={rent_zero.start_time}")
+    assert rent_zero.recurrence_rule == "FREQ=MONTHLY;BYMONTHDAY=5"
+
+    print("\n" + "=" * 70)
+    print("16. Resolving the clarification with 'last day of the month' instead")
+    print("=" * 70)
+    parsed_zero2 = parse_message("rent due on the 0th every month", reference_date=ref)
+    plan_zero2 = build_plan(db, uid, ref, parsed_zero2)
+    item_zero2 = plan_zero2.pending_reminder_clarifications[0]
+    resolve_reminder_clarification(plan_zero2, item_zero2, "2026-08-18", last_day_of_month=True)
+    assert not plan_zero2.has_pending_issues
+    saved_zero2 = confirm_plan(db, plan_zero2)
+    rent_zero2 = next(r for r in saved_zero2 if r.type == "reminder")
+    print(f"saved id={rent_zero2.id} recurrence_rule={rent_zero2.recurrence_rule!r} start_time={rent_zero2.start_time}")
+    assert rent_zero2.recurrence_rule == "FREQ=MONTHLY;BYMONTHDAY=-1"
+
+    print("\n" + "=" * 70)
+    print("17. Resolving into a 29th/30th/31st correctly chains into the month-length warning, not straight to confirm")
+    print("=" * 70)
+    parsed_zero3 = parse_message("rent due on the 0th every month", reference_date=ref)
+    plan_zero3 = build_plan(db, uid, ref, parsed_zero3)
+    item_zero3 = plan_zero3.pending_reminder_clarifications[0]
+    resolve_reminder_clarification(plan_zero3, item_zero3, "2026-08-31")
+    print("pending_month_length_warnings:", [(w.reminder.title, w.reminder.date) for w in plan_zero3.pending_month_length_warnings])
+    assert plan_zero3.has_pending_issues, "should chain into the 29-31 warning, not confirm directly"
+    assert len(plan_zero3.pending_month_length_warnings) == 1
+    assert not plan_zero3.reminders
+    print("  correctly chained into pending_month_length_warnings instead of silently confirming")
 
     db.close()
     print("\nALL RECURRING REMINDER CHECKS PASSED")

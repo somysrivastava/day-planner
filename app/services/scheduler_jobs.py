@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date as date_
 from datetime import datetime, timedelta
 from typing import Literal, Optional
@@ -13,11 +14,25 @@ from apscheduler.triggers.date import DateTrigger
 
 from app.db.base import SessionLocal, engine
 
+logger = logging.getLogger(__name__)
+
 WEEKDAY_CODE_TO_APSCHEDULER = {
     "MO": "mon", "TU": "tue", "WE": "wed", "TH": "thu", "FR": "fri", "SA": "sat", "SU": "sun",
 }
 
 _scheduler: Optional[BackgroundScheduler] = None
+
+# APScheduler's own default misfire_grace_time is 1 second (verified against
+# the installed package, see PROGRESS.md's Week 2 Day 4 notes) - meaning a
+# job that's late by more than ~1 second is silently dropped (logged at
+# WARNING, job.func() never called) rather than fired late. Found via a real
+# leftover job in the job store getting dropped ~6 minutes overdue when a
+# fresh process picked it up. Set generously here instead: nudges/check-ins
+# are time-sensitive but not to-the-second critical - a nudge firing 20
+# minutes late because the process briefly restarted is still useful; one
+# firing 6+ hours late generally isn't. Applied via job_defaults (broadly,
+# to every job on this scheduler), not per-job.
+MISFIRE_GRACE_SECONDS = 60 * 60  # 1 hour
 
 
 def get_scheduler() -> BackgroundScheduler:
@@ -30,10 +45,18 @@ def get_scheduler() -> BackgroundScheduler:
     picklable (an item_id: int, never a Session or ORM object). Each job
     opens its own DB session when it actually fires, since the moment it
     fires could be long after (even a different process from) when it was
-    scheduled."""
+    scheduled.
+
+    A job still overdue beyond MISFIRE_GRACE_SECONDS is dropped, not caught
+    up - see PROGRESS.md's Week 2 Day 4 notes for exactly what that means in
+    production and what partial mitigation already exists for check-ins
+    specifically (there is none for nudges)."""
     global _scheduler
     if _scheduler is None:
-        _scheduler = BackgroundScheduler(jobstores={"default": SQLAlchemyJobStore(engine=engine)})
+        _scheduler = BackgroundScheduler(
+            jobstores={"default": SQLAlchemyJobStore(engine=engine)},
+            job_defaults={"misfire_grace_time": MISFIRE_GRACE_SECONDS},
+        )
         _scheduler.start()
     return _scheduler
 
@@ -43,12 +66,22 @@ def _fire_nudge(item_id: int) -> None:
 
     db = SessionLocal()
     try:
-        item = db.get(Item, item_id)
-        if item is None or item.status == "cancelled":
-            return  # deleted/cancelled since this job was scheduled
-        when = item.start_time.strftime("%I:%M%p").lstrip("0")
-        print(f"[NUDGE] {item.title} starts at {when}")
-        # TODO: real WhatsApp delivery once Week 3 wires up the messaging layer.
+        try:
+            item = db.get(Item, item_id)
+            if item is None or item.status == "cancelled":
+                return  # deleted/cancelled since this job was scheduled - expected, not a failure
+            when = item.start_time.strftime("%I:%M%p").lstrip("0")
+            print(f"[NUDGE] {item.title} starts at {when}")
+            # TODO: real WhatsApp delivery once Week 3 wires up the messaging layer.
+        except Exception:
+            # Week 2 Day 4: APScheduler's own executor already logs any
+            # uncaught exception from a job function (apscheduler.executors.
+            # default, verified empirically), but with no context beyond a
+            # generic job repr. Catching and re-raising here gets the
+            # item_id into the log record before APScheduler's own handling
+            # takes over.
+            logger.error("Nudge fire FAILED for item_id=%s", item_id, exc_info=True)
+            raise
     finally:
         db.close()
 
@@ -58,13 +91,17 @@ def _fire_checkin(item_id: int) -> None:
 
     db = SessionLocal()
     try:
-        item = db.get(Item, item_id)
-        if item is None or item.status in ("cancelled", "done"):
-            return
-        item.checkin_waiting = True
-        db.commit()
-        print(f"[CHECK-IN] Did you get to '{item.title}'?")
-        # TODO: real WhatsApp delivery once Week 3 wires up the messaging layer.
+        try:
+            item = db.get(Item, item_id)
+            if item is None or item.status in ("cancelled", "done"):
+                return
+            item.checkin_waiting = True
+            db.commit()
+            print(f"[CHECK-IN] Did you get to '{item.title}'?")
+            # TODO: real WhatsApp delivery once Week 3 wires up the messaging layer.
+        except Exception:
+            logger.error("Check-in fire FAILED for item_id=%s", item_id, exc_info=True)
+            raise
     finally:
         db.close()
 
@@ -156,46 +193,51 @@ def _fire_evening_checkin(user_id: int) -> list[int]:
 
     db = SessionLocal()
     try:
-        user = db.get(User, user_id)
-        if user is None:
-            return []
-        tz = ZoneInfo(user.timezone)
-        now_local = datetime.now(tz).replace(tzinfo=None)
-        today_local = now_local.date()
+        try:
+            user = db.get(User, user_id)
+            if user is None:
+                logger.warning("Evening check-in fired for user_id=%s but that user no longer exists", user_id)
+                return []
+            tz = ZoneInfo(user.timezone)
+            now_local = datetime.now(tz).replace(tzinfo=None)
+            today_local = now_local.date()
 
-        candidates = (
-            db.query(Item)
-            .filter(
-                Item.user_id == user_id,
-                Item.type == "task",
-                Item.status == "pending",
-                Item.checkin_waiting.is_(False),
-                Item.start_time.isnot(None),
-                Item.end_time.isnot(None),
+            candidates = (
+                db.query(Item)
+                .filter(
+                    Item.user_id == user_id,
+                    Item.type == "task",
+                    Item.status == "pending",
+                    Item.checkin_waiting.is_(False),
+                    Item.start_time.isnot(None),
+                    Item.end_time.isnot(None),
+                )
+                .all()
             )
-            .all()
-        )
-        pending_today = [
-            item
-            for item in candidates
-            if item.start_time.astimezone(tz).replace(tzinfo=None).date() == today_local
-            and item.end_time.astimezone(tz).replace(tzinfo=None) <= now_local
-        ]
+            pending_today = [
+                item
+                for item in candidates
+                if item.start_time.astimezone(tz).replace(tzinfo=None).date() == today_local
+                and item.end_time.astimezone(tz).replace(tzinfo=None) <= now_local
+            ]
 
-        if not pending_today:
-            print("[EVENING CHECK-IN] nothing left over today - skipping silently, no message sent")
-            return []
+            if not pending_today:
+                print("[EVENING CHECK-IN] nothing left over today - skipping silently, no message sent")
+                return []
 
-        for item in pending_today:
-            item.evening_checkin_flagged = True
-        db.commit()
+            for item in pending_today:
+                item.evening_checkin_flagged = True
+            db.commit()
 
-        titles = ", ".join(f"'{i.title}'" for i in pending_today)
-        print(
-            f"[EVENING CHECK-IN] Anything left over from today you want on tomorrow's list? "
-            f"Still pending: {titles}"
-        )
-        return [i.id for i in pending_today]
+            titles = ", ".join(f"'{i.title}'" for i in pending_today)
+            print(
+                f"[EVENING CHECK-IN] Anything left over from today you want on tomorrow's list? "
+                f"Still pending: {titles}"
+            )
+            return [i.id for i in pending_today]
+        except Exception:
+            logger.error("Evening check-in fire FAILED for user_id=%s", user_id, exc_info=True)
+            raise
     finally:
         db.close()
 

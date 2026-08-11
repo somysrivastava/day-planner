@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date as date_
 from datetime import datetime
 from datetime import time as time_
@@ -14,6 +15,8 @@ from app.config import settings
 from app.db.models import Item, User
 from app.services.scheduler import get_effective_schedule
 from app.services.tts import synthesize_speech
+
+logger = logging.getLogger(__name__)
 
 MODEL = "gpt-4o-mini"
 
@@ -89,13 +92,22 @@ def generate_briefing_text(db: Session, user_id: int, target_date: date_) -> str
     day_summary = _describe_day(db, user_id, target_date, tz)
 
     client = OpenAI(api_key=settings.openai_api_key)
-    completion = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": BRIEFING_SYSTEM_PROMPT},
-            {"role": "user", "content": day_summary},
-        ],
-    )
+    try:
+        completion = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": BRIEFING_SYSTEM_PROMPT},
+                {"role": "user", "content": day_summary},
+            ],
+        )
+    except Exception:
+        # No retry/fallback here - this is Week 2 Day 4's "make it visible,
+        # not a monitoring dashboard" scope. Logged then re-raised so the
+        # caller's own failure behavior (whatever wires up the daily
+        # briefing job later) is unchanged - this only adds an otherwise-
+        # missing record of *why* a user got no briefing that day.
+        logger.error("Briefing text generation FAILED for user_id=%s target_date=%s", user_id, target_date, exc_info=True)
+        raise
     return completion.choices[0].message.content
 
 
@@ -110,5 +122,9 @@ def generate_voice_briefing(
     the audio since it's useful on its own (e.g. a text fallback) and for
     verifying what was actually said without needing to listen back."""
     text = generate_briefing_text(db, user_id, target_date)
-    audio = synthesize_speech(text, output_path=output_path, speaking_rate=BRIEFING_SPEAKING_RATE)
+    try:
+        audio = synthesize_speech(text, output_path=output_path, speaking_rate=BRIEFING_SPEAKING_RATE)
+    except Exception:
+        logger.error("TTS generation FAILED for user_id=%s target_date=%s (text was generated fine)", user_id, target_date, exc_info=True)
+        raise
     return text, audio
