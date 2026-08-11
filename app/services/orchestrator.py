@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from calendar import monthrange
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date as date_
@@ -40,12 +41,59 @@ def _next_occurrence_date(from_date: date_, days: list[str]) -> date_:
     raise ValueError(f"No date in the next 7 days matches days={days}")
 
 
+def _ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _last_day_of_month_date(year: int, month: int) -> date_:
+    return date_(year, month, monthrange(year, month)[1])
+
+
+def _resolve_last_day_of_month_item(item: ReminderItem, reference_date: date_) -> ReminderItem:
+    """Corrects `date` deterministically for a last_day_of_month reminder,
+    regardless of what the parser guessed - the LLM only needs to detect
+    the *intent* ('last day of every month'), not do exact calendar math
+    (leap years, 30- vs 31-day months). reference_date's own month always
+    qualifies as 'the next upcoming last day' - the last day of a month is
+    never earlier than any other day within that same month."""
+    resolved = _last_day_of_month_date(reference_date.year, reference_date.month)
+    return item.model_copy(update={"date": resolved.isoformat()})
+
+
+def _next_valid_day_of_month(anchor: date_, new_day: int) -> date_:
+    """Same month/year as `anchor` if it actually has `new_day` days,
+    otherwise rolls forward one month at a time until it finds one that
+    does (e.g. picking 30 while `anchor` is in February)."""
+    year, month = anchor.year, anchor.month
+    while True:
+        if new_day <= monthrange(year, month)[1]:
+            return date_(year, month, new_day)
+        month += 1
+        if month > 12:
+            month, year = 1, year + 1
+
+
 @dataclass
 class RecurringGroup:
     title: str
     days: list[str]
     start: datetime  # naive local, on the group's anchor date
     end: datetime
+
+
+@dataclass
+class MonthLengthWarning:
+    """A recurring reminder anchored on the 29th/30th/31st - per
+    scheduler-algorithm.md's 'Month-length edge case', this needs an
+    explicit confirm-time flag ("won't fire in shorter months like
+    February - keep as-is, or adjust?") rather than silently confirming.
+    Holds the original parsed item, not yet added to plan.reminders."""
+
+    reminder: ReminderItem
 
 
 @dataclass
@@ -65,6 +113,9 @@ class Plan:
     # bare-phrase, no day/duration at all - the fuller Today/Tomorrow/Choose
     # date -> Set a time quick-option flow from the "Vague/keyword-only" spec.
     pending_clarifications: list[TaskItem] = field(default_factory=list)
+    # A recurring reminder anchored on the 29th/30th/31st - see
+    # MonthLengthWarning. Resolved via resolve_month_length_warning().
+    pending_month_length_warnings: list[MonthLengthWarning] = field(default_factory=list)
     # Items resolved to a different date than this plan's target_date - a
     # single build_plan call only schedules one date. Carries the actual
     # item (not just a note) so a caller can act on it - route_message()
@@ -80,6 +131,7 @@ class Plan:
             or self.pending_no_fits
             or self.pending_duration_questions
             or self.pending_clarifications
+            or self.pending_month_length_warnings
         )
 
     def summary_text(self) -> str:
@@ -90,7 +142,11 @@ class Plan:
             days = "/".join(g.days)
             lines.append(f"  - {g.title} at {g.start.strftime('%I:%M%p').lstrip('0')} ({days}, going forward)")
         for r in self.reminders:
-            lines.append(f"  - Reminder: {r.title} on {r.date}")
+            if r.recurring:
+                suffix = " (last day of every month, going forward)" if r.last_day_of_month else " (every month, going forward)"
+            else:
+                suffix = ""
+            lines.append(f"  - Reminder: {r.title} on {r.date}{suffix}")
         for note in self.skip_notes:
             lines.append(f"  - {note}")
         if self.pending_duration_questions:
@@ -99,6 +155,13 @@ class Plan:
         if self.pending_clarifications:
             for t in self.pending_clarifications:
                 lines.append(f"  (need when: '{t.title}' - today, tomorrow, or choose a date?)")
+        if self.pending_month_length_warnings:
+            for w in self.pending_month_length_warnings:
+                day = date_.fromisoformat(w.reminder.date).day
+                lines.append(
+                    f"  (heads up: '{w.reminder.title}' is set for the {_ordinal(day)} - won't fire in "
+                    f"shorter months like February. Keep it as-is, or adjust it?)"
+                )
         if self.pending_collisions:
             lines.append(f"  ({len(self.pending_collisions)} collision(s) still need your input)")
         if self.pending_no_fits:
@@ -288,7 +351,12 @@ def build_plan(db: Session, user_id: int, target_date: date_, parsed: ParsedMess
             plan.recurring_groups.extend(groups)
             plan.pending_no_fits.extend(no_fits)
         elif isinstance(item, ReminderItem):
-            plan.reminders.append(item)
+            if item.last_day_of_month:
+                item = _resolve_last_day_of_month_item(item, target_date)
+            if item.recurring and not item.last_day_of_month and date_.fromisoformat(item.date).day >= 29:
+                plan.pending_month_length_warnings.append(MonthLengthWarning(item))
+            else:
+                plan.reminders.append(item)
 
     return plan
 
@@ -417,6 +485,46 @@ def resolve_clarification(
     plan.task_placements.extend(placements)
     plan.pending_no_fits.extend(no_fits)
     return None
+
+
+def resolve_month_length_warning(
+    plan: Plan,
+    warning: MonthLengthWarning,
+    choice: Literal["keep_as_is", "different_day", "last_day_of_month"],
+    new_day: Optional[int] = None,
+) -> None:
+    """Answers the 29th/30th/31st recurring-reminder warning (see
+    MonthLengthWarning). No DB access needed - like every other resolver,
+    this only edits the in-memory Plan; confirm_plan is still the only
+    thing that writes to the DB.
+
+    - keep_as_is: confirms the reminder exactly as parsed, knowingly
+      skipping shorter months.
+    - different_day: moves it to a new fixed day-of-month (`new_day`,
+      required), rolling forward to the next month that actually has that
+      day if the current one doesn't (e.g. picking 30 while resolving in
+      February).
+    - last_day_of_month: switches to the dedicated last-day-of-month
+      recurrence (BYMONTHDAY=-1 at confirm time) - a real, distinct
+      recurrence option per the spec, not a fallback.
+    """
+    plan.pending_month_length_warnings.remove(warning)
+    reminder = warning.reminder
+
+    if choice == "keep_as_is":
+        plan.reminders.append(reminder)
+    elif choice == "different_day":
+        if new_day is None or not (1 <= new_day <= 31):
+            raise ValueError("new_day must be an int from 1 to 31")
+        anchor = date_.fromisoformat(reminder.date)
+        new_date = _next_valid_day_of_month(anchor, new_day)
+        plan.reminders.append(reminder.model_copy(update={"date": new_date.isoformat()}))
+    elif choice == "last_day_of_month":
+        anchor = date_.fromisoformat(reminder.date)
+        resolved = _last_day_of_month_date(anchor.year, anchor.month)
+        plan.reminders.append(reminder.model_copy(update={"date": resolved.isoformat(), "last_day_of_month": True}))
+    else:
+        raise ValueError(f"Unknown choice {choice!r}")
 
 
 def remove_item(plan: Plan, title: str) -> bool:
@@ -758,11 +866,28 @@ def confirm_plan(db: Session, plan: Plan) -> list[Item]:
     for reminder in plan.reminders:
         # Reminders have no time slot - start_time stores just the trigger
         # date (midnight local), reused rather than adding a new column.
+        # Week 2 Day 1: recurring reminders reuse recurrence_rule too (same
+        # column fixed_event uses) - safe because get_effective_schedule
+        # only ever reads recurrence_rule for type='fixed_event' rows, so a
+        # recurring reminder is structurally invisible to the auto-fit
+        # scheduler, per the spec's "no interaction with the scheduler."
+        anchor_date = date_.fromisoformat(reminder.date)
+        if not reminder.recurring:
+            recurrence_rule = None
+        elif reminder.last_day_of_month:
+            # BYMONTHDAY=-1 is dateutil.rrule's/RFC5545's standard negative-
+            # offset form - "last day of the month," correctly 28/29/30/31
+            # depending on the actual month, not a special case this code
+            # has to compute per-occurrence itself.
+            recurrence_rule = "FREQ=MONTHLY;BYMONTHDAY=-1"
+        else:
+            recurrence_rule = f"FREQ=MONTHLY;BYMONTHDAY={anchor_date.day}"
         row = Item(
             user_id=plan.user_id,
             type="reminder",
             title=reminder.title,
-            start_time=to_aware(datetime.combine(date_.fromisoformat(reminder.date), time_.min)),
+            start_time=to_aware(datetime.combine(anchor_date, time_.min)),
+            recurrence_rule=recurrence_rule,
         )
         db.add(row)
         saved.append(row)

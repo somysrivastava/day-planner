@@ -19,7 +19,9 @@ class ReminderItem(BaseModel):
 
     type: Literal["reminder"]
     title: str
-    date: str  # ISO 8601 date this reminder fires on, e.g. "2026-08-12"
+    date: str  # ISO 8601 date this reminder fires on (or, if recurring, its next/anchor occurrence)
+    recurring: bool = False  # true for "every month on the Nth" - day-of-month is derived from `date`
+    last_day_of_month: bool = False  # true for "the last day of every month" - a distinct recurrence, not a fallback; implies recurring=True. `date` is corrected deterministically downstream regardless of what's set here, so an approximate guess is fine.
 
 
 class TaskItem(BaseModel):
@@ -81,7 +83,12 @@ def _system_prompt(reference_date: dt.date, timezone: str) -> str:
 Reference date: {reference_date.isoformat()} ({weekday}). User's timezone: {timezone}. Resolve all relative dates ("today", "tomorrow", "next Monday") against this reference date into absolute ISO 8601 dates (YYYY-MM-DD).
 
 Classify each distinct thing the user mentions as exactly one of:
-- reminder: has a future date, no time slot. If the user asks for advance notice (e.g. "remind me 3 days before and 1 day before X"), emit one reminder item per stated interval, PLUS one additional reminder item dated on the deadline day itself - every advance-reminder request produces stated-intervals + 1 total items, never fewer.
+- reminder: has a future date, no time slot.
+  - Plain one-time reminder ("remind me to submit tax by the 15th"): exactly one item, recurring=false, `date` set to that date.
+  - Advance notice on a one-time reminder ("remind me 3 days before and 1 day before X"): emit one item per stated interval, PLUS one additional item dated on the deadline day itself - stated-intervals + 1 total items, all recurring=false.
+  - Monthly-recurring reminder, no advance notice ("rent due on the 5th every month"): exactly ONE item, recurring=true, `date` set to the next upcoming occurrence of that day-of-month (this month's if not yet passed, otherwise next month's). CRITICAL: recurring=true by itself already means "this fires every month going forward" - do NOT enumerate multiple items for multiple future months. One recurring reminder is always exactly one item, never N items for N future occurrences.
+  - "Last day of every month" recurring reminder: exactly ONE item, recurring=true AND last_day_of_month=true (the exact `date` doesn't need to be precise, it's corrected deterministically downstream) - same one-item rule as above.
+  - Advance notice on a monthly-recurring reminder ("remind me 3 days before rent is due every month", rent on the 5th): treat exactly like advance notice on a one-time reminder, but every resulting item ALSO gets recurring=true, and each item's `date` is that stated interval's own single anchor day-of-month (3 days before the 5th -> the 2nd) - so this example produces exactly 2 items total (5th and 2nd, both recurring=true, one item each), not one item per interval per future month. The "stated-intervals + 1 items" rule and the "one item per recurring reminder" rule combine by multiplying intervals, never by multiplying months.
 - task: one-off, needs a time slot, no explicit clock time was stated. Extract duration_minutes if stated or clearly inferable. Set needs_clarification to true ONLY when BOTH the day and the duration are absent from the message. If either one is stated or inferable, set needs_clarification to false even though the other is still missing - do not guess the missing one, just leave it null.
 - recurring_task: daily or day-specific repeating language ("every day", "read Mon/Wed/Fri"). If the message describes one repeating commitment, return it as a single recurring_task item, even if the time differs by day - list every applicable weekday in `days` and each day's time (or null if still needs asking) in `times`. Do not split one commitment into multiple recurring_task items.
 - explicit_time_item: the user gave a specific clock time (e.g. "at 2pm", "2-3pm"). This skips all scheduling logic - record the date (assume the reference date if none stated) and time only.

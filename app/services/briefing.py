@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import date as date_
+from datetime import datetime
+from datetime import time as time_
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+from dateutil.rrule import rrulestr
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
@@ -27,19 +30,31 @@ You'll be given the day's schedule (fixed events and already-placed tasks, chron
 """
 
 
-def _to_local_date(dt, tz: ZoneInfo) -> date_:
-    return dt.astimezone(tz).replace(tzinfo=None).date()
+def _reminder_occurs_on(reminder: Item, target_date: date_, tz: ZoneInfo) -> bool:
+    """True if this reminder should surface in target_date's briefing.
+    Non-recurring: exact match against its single stored date, as before.
+    Recurring (Week 2 Day 1): RRULE-expanded the same way
+    scheduler.get_effective_schedule expands fixed_event occurrences -
+    duplicated here as a small local helper rather than importing
+    scheduler's private _occurs_on, since the two only share ~4 lines."""
+    anchor_local = reminder.start_time.astimezone(tz).replace(tzinfo=None)
+    if not reminder.recurrence_rule:
+        return anchor_local.date() == target_date
+    rule = rrulestr(reminder.recurrence_rule, dtstart=anchor_local)
+    day_start = datetime.combine(target_date, time_.min)
+    day_end = datetime.combine(target_date, time_.max)
+    return len(rule.between(day_start, day_end, inc=True)) > 0
 
 
 def _describe_day(db: Session, user_id: int, target_date: date_, tz: ZoneInfo) -> str:
     blocks = get_effective_schedule(db, user_id, target_date)
 
-    reminders_today = (
+    all_reminders = (
         db.query(Item)
         .filter(Item.user_id == user_id, Item.type == "reminder", Item.status != "cancelled")
         .all()
     )
-    reminders_today = [r for r in reminders_today if _to_local_date(r.start_time, tz) == target_date]
+    reminders_today = [r for r in all_reminders if _reminder_occurs_on(r, target_date, tz)]
 
     lines = [f"Date: {target_date.strftime('%A, %B %d, %Y')}"]
     if blocks:
