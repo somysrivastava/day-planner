@@ -2,9 +2,13 @@ from google_auth_oauthlib.flow import Flow
 
 from app.config import settings
 
-# Desktop-type OAuth clients can use any localhost redirect without
-# pre-registering it in the Google Cloud Console.
-REDIRECT_URI = "http://localhost:8000/auth/google/callback"
+# Locally this can stay the default localhost value (Desktop-type OAuth
+# clients accept any localhost redirect without pre-registering it). Once
+# deployed, GOOGLE_REDIRECT_URI must be set to the real HTTPS URL and that
+# exact value added to the OAuth client's "Authorized redirect URIs" in
+# Google Cloud Console - unlike localhost, non-localhost redirect URIs are
+# not accepted unless explicitly registered.
+REDIRECT_URI = settings.google_redirect_uri
 
 # Full read/write access to calendars — we need write access to create events.
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
