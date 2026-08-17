@@ -41,9 +41,22 @@ def cleanup_test_data(db):
     entries. Reset to a clean baseline before each run: delete all tasks
     (never seeded, always test-created), all overrides, and any
     fixed_event whose anchor date isn't one of the two seed anchors
-    (i.e. a promoted recurring task from a previous test run)."""
+    (i.e. a promoted recurring task from a previous test run).
+
+    Also deletes this script's own "submit the tax report" reminder
+    (scenario 7/8's "get a haircut today, and submit the tax report by
+    Wednesday" message produces one each run) - found via real dogfooding
+    (Week 2 Day 6) that this was never cleaned up like tasks are, so it had
+    silently accumulated 11 duplicates on the real user's account across
+    every regression run since Week 1 Day 4. Scoped narrowly by title
+    (case-insensitive, LLM capitalization isn't deterministic) rather than
+    deleting all reminders, since a real reminder could legitimately exist
+    for these users too."""
     uids = [user_id(db, p) for p in (YOU, SPARSE, PACKED, NO_MORNING)]
     db.query(Item).filter(Item.user_id.in_(uids), Item.type == "task").delete(synchronize_session=False)
+    db.query(Item).filter(
+        Item.user_id.in_(uids), Item.type == "reminder", Item.title.ilike("%tax report%")
+    ).delete(synchronize_session=False)
     db.query(FixedEventOverride).filter(
         FixedEventOverride.item_id.in_(db.query(Item.id).filter(Item.user_id.in_(uids)))
     ).delete(synchronize_session=False)

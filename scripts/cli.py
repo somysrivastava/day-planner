@@ -25,7 +25,9 @@ from app.services.orchestrator import (  # noqa: E402
     resolve_clarification,
     resolve_collision,
     resolve_duration_question,
+    resolve_month_length_warning,
     resolve_no_fit,
+    resolve_reminder_clarification,
     route_message,
 )
 from app.services.parser import parse_message  # noqa: E402
@@ -138,6 +140,25 @@ def resolve_pending_interactively(db, plan: Plan) -> None:
             note = resolve_no_fit(db, plan, nf, "shift_to_tomorrow" if choice.startswith("t") else "force_today")
             if note:
                 print(f"  ({note})")
+        elif plan.pending_month_length_warnings:
+            w = plan.pending_month_length_warnings[0]
+            choice = input(
+                f"  '{w.reminder.title}' ({w.reminder.date}) is anchored on the 29th-31st and won't fire in "
+                f"shorter months - keep as-is, pick a different day, or always use the last day of the month? "
+                f"(keep/different/last) "
+            ).strip().lower()
+            if choice.startswith("d"):
+                new_day = input("  New day of month (1-28)? ").strip()
+                resolve_month_length_warning(plan, w, "different_day", new_day=int(new_day))
+            elif choice.startswith("l"):
+                resolve_month_length_warning(plan, w, "last_day_of_month")
+            else:
+                resolve_month_length_warning(plan, w, "keep_as_is")
+        elif plan.pending_reminder_clarifications:
+            r = plan.pending_reminder_clarifications[0]
+            date_str = input(f"  '{r.title}' - what date did you actually mean (YYYY-MM-DD)? ").strip()
+            ldm = input("  Should this always be the last day of the month? (y/n) ").strip().lower().startswith("y")
+            resolve_reminder_clarification(plan, r, date_str, last_day_of_month=ldm)
 
 
 def confirm_now(sess: Session, d: date) -> None:
