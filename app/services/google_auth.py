@@ -13,6 +13,14 @@ REDIRECT_URI = settings.google_redirect_uri
 # Full read/write access to calendars — we need write access to create events.
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+# The "installed" key here is cosmetic bookkeeping local to this library
+# (verified from google_auth_oauthlib/flow.py and helpers.py: from_client_config
+# just does client_config[client_type] and extracts the same fields either
+# way) - it is never sent to Google, so this same dict shape works whether
+# GOOGLE_CLIENT_ID/SECRET actually belong to the Desktop-app client (local
+# dev) or the separate Web-application client (production - see ADR-015).
+# Google's own redirect-URI validation is entirely server-side, keyed off
+# which Console client the id/secret belong to, not this key name.
 CLIENT_CONFIG = {
     "installed": {
         "client_id": settings.google_client_id,

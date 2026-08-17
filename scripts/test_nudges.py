@@ -163,7 +163,18 @@ def live_fire_proof():
     # is correct, not stale. What actually proves it's live is next_run_time
     # matching the NEW end_time, not the id changing.
     job = scheduler_jobs.get_scheduler().get_job(rescheduled.checkin_job_id)
-    assert job.next_run_time.replace(tzinfo=None) == rescheduled.end_time.replace(tzinfo=None), (
+    # Compare the aware datetimes directly - do NOT strip tzinfo first.
+    # job.next_run_time comes back in the scheduler's own default timezone
+    # (tzlocal.get_localzone() - the host machine's system tz, since
+    # BackgroundScheduler() is never given an explicit timezone=), while
+    # rescheduled.end_time round-trips through Postgres still carrying the
+    # user's IANA tz (Asia/Kolkata). On a dev machine whose system tz happens
+    # to already be Asia/Kolkata these silently matched by coincidence; on a
+    # host running in UTC (e.g. Render's containers) they're both correct,
+    # same real instant, different tzinfo - stripping tzinfo before
+    # comparing turned that coincidence-masked case into a false mismatch.
+    # Aware-to-aware comparison accounts for the offset correctly either way.
+    assert job.next_run_time == rescheduled.end_time, (
         f"check-in job's next_run_time ({job.next_run_time}) should match the item's new end_time ({rescheduled.end_time})"
     )
     assert rescheduled.checkin_waiting is False, "checkin_waiting should be cleared once answered"
