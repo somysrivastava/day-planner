@@ -175,6 +175,106 @@ def parse_message(
     return message.parsed
 
 
+class _DurationReply(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    minutes: Optional[int] = Field(
+        default=None,
+        description="The duration in whole minutes described by the reply, if one is stated or clearly "
+        "inferable - e.g. '10 mins'->10, '5 minutes max'->5, 'about 20'->20, 'half an hour'->30, "
+        "'an hour and a half'->90, 'quarter of an hour'->15. Null if the reply doesn't actually state or "
+        "clearly imply a duration at all (e.g. 'not sure', 'later').",
+    )
+
+
+class _DateReply(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    date: Optional[str] = Field(
+        default=None,
+        description="A real calendar date in ISO 8601 'YYYY-MM-DD' form matching the reply, resolved "
+        "relative to the given reference date - e.g. 'the 31st' -> the 31st of the reference month (or "
+        "next month if this month doesn't have a 31st, or if the 31st this month has already passed), "
+        "'next Friday', 'end of the month', 'in 3 days' all resolved the same way. Must be an actual "
+        "valid calendar date (never day 30 in February). Null if the reply doesn't actually state or "
+        "clearly imply a real date at all (e.g. 'not sure', 'soon').",
+    )
+
+
+def parse_duration_reply(text: str) -> Optional[int]:
+    """Extracts a duration in minutes from a short, direct reply to a
+    'how long will this take?' question - e.g. answering a
+    pending_duration_question or pending_clarification. Deliberately a
+    separate, smaller LLM call from parse_message: that function solves a
+    harder, different problem (classifying a whole free-form message into
+    one of 4 item types), and reusing it here would force-fit a bare reply
+    like '5 minutes max' into that unrelated schema instead of just
+    extracting the one field actually being asked for. Returns None (not
+    an exception) if no real duration could be extracted - callers should
+    treat that as 'ask again', not a failure."""
+    client = OpenAI(api_key=settings.openai_api_key)
+    try:
+        completion = client.chat.completions.parse(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "The user was just asked 'how long will this take?'. Extract the duration "
+                    "in minutes from their reply.",
+                },
+                {"role": "user", "content": text},
+            ],
+            response_format=_DurationReply,
+        )
+    except Exception:
+        logger.error("Duration-reply parse call FAILED for text=%r", text, exc_info=True)
+        raise
+
+    message = completion.choices[0].message
+    if message.refusal or message.parsed is None:
+        return None
+    return message.parsed.minutes
+
+
+def parse_date_reply(text: str, reference_date: Optional[dt.date] = None) -> Optional[dt.date]:
+    """Extracts a real calendar date from a short, direct reply to a 'what
+    date did you mean?' question. Same reasoning as parse_duration_reply
+    above - a separate, smaller LLM call rather than reusing parse_message.
+    Returns None if no real date could be extracted, or if the model
+    somehow still returns a calendar-invalid string (defensive - same
+    posture as orchestrator.py's _safe_parse_date, verified necessary
+    there for LLM-produced dates) - callers should treat either as 'ask
+    again', not a failure."""
+    reference_date = reference_date or dt.date.today()
+    client = OpenAI(api_key=settings.openai_api_key)
+    try:
+        completion = client.chat.completions.parse(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"Today's date is {reference_date.isoformat()}. The user was just asked "
+                    "'what date did you mean?'. Extract the real calendar date from their reply, resolved "
+                    "relative to today's date.",
+                },
+                {"role": "user", "content": text},
+            ],
+            response_format=_DateReply,
+        )
+    except Exception:
+        logger.error("Date-reply parse call FAILED for text=%r reference_date=%s", text, reference_date, exc_info=True)
+        raise
+
+    message = completion.choices[0].message
+    if message.refusal or message.parsed is None or message.parsed.date is None:
+        return None
+    try:
+        return dt.date.fromisoformat(message.parsed.date)
+    except ValueError:
+        logger.warning("Date-reply parse returned a calendar-invalid date %r for text=%r", message.parsed.date, text)
+        return None
+
+
 def check_collision(item: ParsedItem, user_id: int) -> bool:
     """TODO(Day 4): query the items table for overlapping start/end times
     once the scheduler's DB access patterns are built. Placeholder for now."""

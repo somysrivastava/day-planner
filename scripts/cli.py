@@ -7,8 +7,9 @@ that would otherwise require waiting on real clock time. Run with:
 """
 
 import sys
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -18,7 +19,7 @@ from app.services import scheduler_jobs  # noqa: E402
 from app.services.briefing import generate_voice_briefing  # noqa: E402
 from app.services.orchestrator import (  # noqa: E402
     Plan,
-    build_plan,  # noqa: F401  (kept available for direct use if a future command needs it)
+    build_plan,
     confirm_plan,
     remove_item,
     reschedule_item,
@@ -30,7 +31,7 @@ from app.services.orchestrator import (  # noqa: E402
     resolve_reminder_clarification,
     route_message,
 )
-from app.services.parser import parse_message  # noqa: E402
+from app.services.parser import ParsedMessage, parse_date_reply, parse_duration_reply, parse_message  # noqa: E402
 
 SEED_USERS = {
     "you": "+919354211791",
@@ -58,6 +59,57 @@ Commands:
   :answer_evening <item_id> tomorrow|choose_date|keep_pending [YYYY-MM-DD]
   :quit                          exit
 """.strip()
+
+def ask_minutes(prompt: str, allow_blank: bool = False) -> Optional[int]:
+    """Prompts on a loop until a duration can be extracted, instead of
+    letting a malformed answer crash the REPL. allow_blank=True lets an
+    empty answer through as None (used where blank means "keep the
+    current value"). Duration extraction is genuinely natural-language
+    (parser.parse_duration_reply, LLM-backed) - a first pass at this used
+    a small local regex parser, but that broke on "5 minutes max" right
+    after fixing the original "10 mins" crash, which is exactly the
+    "patch individual phrasings forever" trap the real parser.py already
+    exists to avoid. See parse_duration_reply's docstring for why this is
+    a separate, smaller LLM call rather than reusing parse_message."""
+    while True:
+        raw = input(prompt).strip()
+        if not raw and allow_blank:
+            return None
+        minutes = parse_duration_reply(raw)
+        if minutes is not None:
+            return minutes
+        print(f"  Didn't catch a duration in {raw!r} - try something like '45', '10 mins', or 'half an hour'.")
+
+
+def ask_int(prompt: str) -> int:
+    """Same retry-on-malformed-input pattern as ask_minutes/ask_date, for
+    plain integer answers (e.g. 'new day of month') that were previously a
+    bare int() call - same crash class, found by inspection while fixing
+    the other two (Week 2 Day 6 dogfooding). Deliberately NOT routed
+    through the LLM like ask_minutes/ask_date - this answers a highly
+    constrained question ("a day of month, 1-28") where a bare int() is
+    actually sufficient and natural-language phrasing isn't expected."""
+    while True:
+        raw = input(prompt).strip()
+        try:
+            return int(raw)
+        except ValueError:
+            print(f"  {raw!r} isn't a whole number - try again.")
+
+
+def ask_date(prompt: str) -> date:
+    """Prompts on a loop until a real date can be extracted, instead of a
+    bare date.fromisoformat() crashing the REPL on anything else typed.
+    Date extraction is genuinely natural-language (parser.parse_date_reply,
+    LLM-backed, same reasoning as ask_minutes above) - a first pass only
+    accepted the literal words "today"/"tomorrow" or an exact YYYY-MM-DD,
+    which rejected something as ordinary as "the 31st of this month"."""
+    while True:
+        raw = input(prompt).strip()
+        day = parse_date_reply(raw)
+        if day is not None:
+            return day
+        print(f"  Didn't catch a real date in {raw!r} - try something like 'today', 'the 31st', or 'next Friday'.")
 
 
 class Session:
@@ -104,26 +156,36 @@ def show_items(sess: Session) -> None:
         print(f"  id={r.id:<4} {r.type:<12} {r.status:<9} {r.start_time} -> {r.end_time}  {r.title!r}{flag_str}")
 
 
-def resolve_pending_interactively(db, plan: Plan) -> None:
+def resolve_pending_interactively(sess: Session, plan: Plan) -> None:
+    db = sess.db
     while plan.has_pending_issues:
         if plan.pending_duration_questions:
             t = plan.pending_duration_questions[0]
-            minutes = input(f"  How long do you think '{t.title}' will take (minutes)? ").strip()
-            resolve_duration_question(db, plan, t, int(minutes))
+            minutes = ask_minutes(f"  How long do you think '{t.title}' will take? ")
+            resolve_duration_question(db, plan, t, minutes)
         elif plan.pending_clarifications:
             t = plan.pending_clarifications[0]
-            when = input(f"  When should '{t.title}' happen? (today/tomorrow/YYYY-MM-DD) ").strip().lower()
-            if when == "today":
-                day = date.today()
-            elif when == "tomorrow":
-                day = date.today() + timedelta(days=1)
-            else:
-                day = date.fromisoformat(when)
+            day = ask_date(f"  When should '{t.title}' happen? (today/tomorrow/YYYY-MM-DD) ")
             tod = input("  Time of day preference (morning/afternoon/evening, blank = none)? ").strip().lower() or None
-            minutes = input(f"  How long will '{t.title}' take (minutes)? ").strip()
-            note = resolve_clarification(db, plan, t, day, int(minutes), tod)
+            minutes = ask_minutes(f"  How long will '{t.title}' take? ")
+            note = resolve_clarification(db, plan, t, day, minutes, tod)
             if note:
+                # resolve_clarification deliberately doesn't build a plan for
+                # a different date itself (see its docstring) - it's on the
+                # caller to actually route it there. cli.py used to just
+                # print the note and silently drop the item (found via real
+                # dogfooding, Week 2 Day 6 - "call the plumber" -> "tomorrow"
+                # vanished with no error and no DB row). Build and confirm a
+                # real plan for that date instead, same as route_message
+                # would for a multi-date message.
                 print(f"  ({note})")
+                corrected = t.model_copy(update={
+                    "day": day.isoformat(), "duration_minutes": minutes,
+                    "time_of_day_preference": tod, "needs_clarification": False,
+                })
+                new_plan = build_plan(db, sess.user.id, day, ParsedMessage(items=[corrected]))
+                sess.pending_plans[day] = new_plan
+                confirm_now(sess, day)
         elif plan.pending_collisions:
             c = plan.pending_collisions[0]
             choice = input(
@@ -148,8 +210,8 @@ def resolve_pending_interactively(db, plan: Plan) -> None:
                 f"(keep/different/last) "
             ).strip().lower()
             if choice.startswith("d"):
-                new_day = input("  New day of month (1-28)? ").strip()
-                resolve_month_length_warning(plan, w, "different_day", new_day=int(new_day))
+                new_day = ask_int("  New day of month (1-28)? ")
+                resolve_month_length_warning(plan, w, "different_day", new_day=new_day)
             elif choice.startswith("l"):
                 resolve_month_length_warning(plan, w, "last_day_of_month")
             else:
@@ -171,7 +233,7 @@ def confirm_now(sess: Session, d: date) -> None:
         print(f"\n--- Plan for {d} ---")
         print(plan.summary_text())
         if plan.has_pending_issues:
-            resolve_pending_interactively(sess.db, plan)
+            resolve_pending_interactively(sess, plan)
             continue
 
         ans = input("Confirm this plan? (yes/no) ").strip().lower()
@@ -192,9 +254,9 @@ def confirm_now(sess: Session, d: date) -> None:
             if action == "drop":
                 print("Dropped." if remove_item(plan, title) else "Not found in this plan.")
             elif action == "move":
-                minutes = input("  New duration in minutes (blank = keep current)? ").strip()
+                minutes = ask_minutes("  New duration (blank = keep current)? ", allow_blank=True)
                 tod = input("  New time-of-day preference (morning/afternoon/evening, blank = none)? ").strip().lower()
-                result = reschedule_item(sess.db, plan, title, int(minutes) if minutes else None, tod or None)
+                result = reschedule_item(sess.db, plan, title, minutes, tod or None)
                 if result:
                     print(f"  Still no fit: {result.reason}")
             else:
