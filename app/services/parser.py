@@ -275,6 +275,60 @@ def parse_date_reply(text: str, reference_date: Optional[dt.date] = None) -> Opt
         return None
 
 
+class _ConfirmationReply(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intent: Literal["yes", "no_plain", "no_with_info", "unclear"] = Field(
+        description="How to interpret a reply to 'does this plan look good?' that wasn't a clean literal "
+        "yes/no. 'yes': a clear affirmative in different words (e.g. 'sounds good', 'yep', 'looks right', "
+        "'that works'). 'no_plain': a clear negative with no further detail (e.g. 'nope', 'not quite', "
+        "'no thanks'). 'no_with_info': the reply is NOT a clean yes, and it states something real and "
+        "relevant - a correction, a new commitment, something to change - even without literally saying "
+        "'no' (e.g. 'on friday i have a meeting with shouri at 4:30pm keep in mind'). 'unclear': the reply "
+        "doesn't actually address the plan at all - an unrelated question, small talk, or a genuinely "
+        "noncommittal non-answer ('sounds ok I guess', 'idk', 'maybe'). Do not guess 'yes' or 'no_plain' "
+        "just to force a decision - use 'unclear' when the reply is genuinely ambiguous rather than assume "
+        "what the user meant.",
+    )
+
+
+def classify_confirmation_reply(text: str) -> Literal["yes", "no_plain", "no_with_info", "unclear"]:
+    """Classifies a reply to a plan confirmation ('does this look good?')
+    that wasn't a clean literal yes/no - e.g. cli.py's confirm_now() only
+    ever checked for literal 'y'/'yes'/'n'/'no' and rejected anything else
+    outright with 'Please answer yes or no', discarding real content when
+    someone typed a correction instead of a clean answer (found via real
+    dogfooding, Week 2 Day 6). Per scheduler-algorithm.md's Quick-reply
+    pattern, tappable Yes/No buttons are the intended *primary* interaction
+    for this exact prompt (Week 3, WhatsApp) - this function is specifically
+    the free-text fallback for when someone types instead of tapping, which
+    WhatsApp still allows even with buttons shown, not a replacement for
+    buttons. Only called when the literal-yes/no fast path doesn't match,
+    so it's never on the hot path for a normal clean confirmation."""
+    client = OpenAI(api_key=settings.openai_api_key)
+    try:
+        completion = client.chat.completions.parse(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "The user was just asked 'does this plan look good?' and replied with "
+                    "something other than a clean 'yes' or 'no'. Classify their reply.",
+                },
+                {"role": "user", "content": text},
+            ],
+            response_format=_ConfirmationReply,
+        )
+    except Exception:
+        logger.error("Confirmation-reply classify call FAILED for text=%r", text, exc_info=True)
+        raise
+
+    message = completion.choices[0].message
+    if message.refusal or message.parsed is None:
+        return "unclear"
+    return message.parsed.intent
+
+
 def check_collision(item: ParsedItem, user_id: int) -> bool:
     """TODO(Day 4): query the items table for overlapping start/end times
     once the scheduler's DB access patterns are built. Placeholder for now."""

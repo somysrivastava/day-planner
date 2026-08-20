@@ -31,7 +31,13 @@ from app.services.orchestrator import (  # noqa: E402
     resolve_reminder_clarification,
     route_message,
 )
-from app.services.parser import ParsedMessage, parse_date_reply, parse_duration_reply, parse_message  # noqa: E402
+from app.services.parser import (  # noqa: E402
+    ParsedMessage,
+    classify_confirmation_reply,
+    parse_date_reply,
+    parse_duration_reply,
+    parse_message,
+)
 
 SEED_USERS = {
     "you": "+919354211791",
@@ -223,6 +229,52 @@ def resolve_pending_interactively(sess: Session, plan: Plan) -> None:
             resolve_reminder_clarification(plan, r, date_str, last_day_of_month=ldm)
 
 
+def _do_confirm(sess: Session, plan: Plan, d: date) -> None:
+    saved = confirm_plan(sess.db, plan)
+    print(f"Confirmed - {len(saved)} item(s) saved:")
+    for row in saved:
+        print(f"  id={row.id} {row.title!r} start={row.start_time} important={row.important}")
+    # Identity check, not a plain `del` - found via testing the
+    # no_with_info path (Week 2 Day 6): if a correction resolves to the
+    # SAME date as the plan already being confirmed ("tomorrow" and "next
+    # Friday" can coincide), handle_message() overwrites
+    # sess.pending_plans[d] with the new plan and confirms/deletes it
+    # first (nested call), so by the time this outer plan finishes
+    # confirming, its own dict slot is already gone - a bare `del` here
+    # crashed with KeyError. Only remove the slot if it still points at
+    # *this* plan.
+    if sess.pending_plans.get(d) is plan:
+        del sess.pending_plans[d]
+
+
+def _handle_rejection(sess: Session, plan: Plan) -> bool:
+    """The existing 'no -> what would you like changed?' sub-flow (drop
+    <title> / move <title> / done) - unchanged. Reached either from a
+    plain literal 'no' or from classify_confirmation_reply's 'no_plain'
+    (a clear no with nothing further to interpret). Returns True if the
+    caller (confirm_now) should stop and leave the plan unconfirmed
+    (chose 'done'/blank), False if it should loop back and re-show the
+    plan (a drop/move was actually applied, or the action wasn't
+    recognized and they should get another chance)."""
+    change = input("What would you like changed? (drop <title> / move <title> / done) ").strip()
+    if not change or change.lower() == "done":
+        print("Leaving this plan unconfirmed for now.")
+        return True
+    action, _, rest = change.partition(" ")
+    title = rest.strip()
+    if action == "drop":
+        print("Dropped." if remove_item(plan, title) else "Not found in this plan.")
+    elif action == "move":
+        minutes = ask_minutes("  New duration (blank = keep current)? ", allow_blank=True)
+        tod = input("  New time-of-day preference (morning/afternoon/evening, blank = none)? ").strip().lower()
+        result = reschedule_item(sess.db, plan, title, minutes, tod or None)
+        if result:
+            print(f"  Still no fit: {result.reason}")
+    else:
+        print(f"Unrecognized action {action!r}. Try 'drop <title>' or 'move <title>'.")
+    return False
+
+
 def confirm_now(sess: Session, d: date) -> None:
     plan = sess.pending_plans.get(d)
     if plan is None:
@@ -236,33 +288,43 @@ def confirm_now(sess: Session, d: date) -> None:
             resolve_pending_interactively(sess, plan)
             continue
 
-        ans = input("Confirm this plan? (yes/no) ").strip().lower()
+        raw = input("Confirm this plan? (yes/no) ").strip()
+        ans = raw.lower()
         if ans in ("y", "yes"):
-            saved = confirm_plan(sess.db, plan)
-            print(f"Confirmed - {len(saved)} item(s) saved:")
-            for row in saved:
-                print(f"  id={row.id} {row.title!r} start={row.start_time} important={row.important}")
-            del sess.pending_plans[d]
+            _do_confirm(sess, plan, d)
             return
         elif ans in ("n", "no"):
-            change = input("What would you like changed? (drop <title> / move <title> / done) ").strip()
-            if not change or change.lower() == "done":
-                print("Leaving this plan unconfirmed for now.")
+            if _handle_rejection(sess, plan):
                 return
-            action, _, rest = change.partition(" ")
-            title = rest.strip()
-            if action == "drop":
-                print("Dropped." if remove_item(plan, title) else "Not found in this plan.")
-            elif action == "move":
-                minutes = ask_minutes("  New duration (blank = keep current)? ", allow_blank=True)
-                tod = input("  New time-of-day preference (morning/afternoon/evening, blank = none)? ").strip().lower()
-                result = reschedule_item(sess.db, plan, title, minutes, tod or None)
-                if result:
-                    print(f"  Still no fit: {result.reason}")
-            else:
-                print(f"Unrecognized action {action!r}. Try 'drop <title>' or 'move <title>'.")
+            continue
+
+        # Not a clean literal yes/no. scheduler-algorithm.md's Quick-reply
+        # pattern makes tappable Yes/No buttons the intended *primary*
+        # interaction for this prompt (Week 3, WhatsApp) - this is
+        # specifically the free-text fallback for someone typing instead
+        # of tapping, which WhatsApp still allows even with buttons shown.
+        # Previously any non-literal answer was rejected outright with
+        # "Please answer yes or no", silently discarding real content when
+        # the reply was actually a correction (found via real dogfooding,
+        # Week 2 Day 6 - "on friday i have a meeting with shouri..." got
+        # thrown away instead of recognized as new information).
+        intent = classify_confirmation_reply(raw)
+        if intent == "yes":
+            _do_confirm(sess, plan, d)
+            return
+        elif intent == "no_plain":
+            if _handle_rejection(sess, plan):
+                return
+        elif intent == "no_with_info":
+            print("  (that's not a plain yes - treating it as new information rather than a change to this plan)")
+            handle_message(sess, raw)
+            # handle_message may have routed this to a different date (or
+            # even rebuilt sess.pending_plans[d] itself, if it resolved to
+            # today) - either way, loop back and re-ask about THIS plan
+            # (the local `plan` variable, not re-fetched from the dict) so
+            # the original yes/no question still gets answered.
         else:
-            print("Please answer yes or no.")
+            print("  Didn't catch a clear yes, no, or something to change there - try again?")
 
 
 def handle_message(sess: Session, text: str) -> None:
